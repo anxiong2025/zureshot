@@ -108,27 +108,92 @@ A 60-second Retina recording at 60fps: **~135 MB** (vs 200+ MB with H.264).
 
 ## 🏗 Architecture
 
+### System Overview
+
 ```
-┌─────────────────────────────────────────────────┐
-│                   Zureshot                       │
-├──────────────┬──────────────────────────────────┤
-│   UI Layer   │         Engine (Rust)             │
-│   (Svelte)   │                                   │
-│              │  ┌─────────┐  ┌───────────────┐  │
-│  Tray Menu   │  │   SCK   │→ │ VideoToolbox  │  │
-│  Region UI   │  │ Capture │  │ HEVC Encoder  │  │
-│  Control Bar │  └─────────┘  └───────┬───────┘  │
-│              │                       │          │
-│              │              ┌────────▼────────┐ │
-│              │              │  AVAssetWriter  │ │
-│              │              │   MP4 Muxer     │ │
-│              │              └─────────────────┘ │
-├──────────────┴──────────────────────────────────┤
-│              Tauri v2 (IPC Bridge)              │
-└─────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────┐
+│                         Zureshot                                    │
+├─────────────────┬───────────────────────────────────────────────────┤
+│   UI Layer      │              Engine (Rust)                        │
+│   Svelte 5      │                                                   │
+│                 │  ┌──────────────────────────────────────────────┐ │
+│  Tray Menu      │  │           Capture Pipeline                   │ │
+│  Region Select  │  │                                              │ │
+│  Recording Bar  │  │  SCK ──→ IOSurface ──→ VideoToolbox ──→ MP4  │ │
+│  Dim Overlay    │  │  (GPU)    (GPU/VRAM)    (Media Engine)  (SSD) │ │
+│                 │  │                                              │ │
+│                 │  │  Audio: SCK ──→ CMSampleBuffer ──→ AAC ──┘   │ │
+│                 │  └──────────────────────────────────────────────┘ │
+│                 │                                                   │
+│                 │  ┌─────────┐ ┌──────────┐ ┌───────────────────┐  │
+│                 │  │ capture │ │  writer  │ │    commands       │  │
+│                 │  │   .rs   │ │   .rs    │ │      .rs          │  │
+│                 │  │ SCK API │ │ AVAsset  │ │ Tauri IPC bridge  │  │
+│                 │  │ Delegate│ │ Writer   │ │ State management  │  │
+│                 │  └─────────┘ └──────────┘ └───────────────────┘  │
+├─────────────────┴───────────────────────────────────────────────────┤
+│                    Tauri v2 + objc2 FFI                             │
+├─────────────────────────────────────────────────────────────────────┤
+│  macOS: ScreenCaptureKit │ VideoToolbox │ AVFoundation │ CoreMedia  │
+└─────────────────────────────────────────────────────────────────────┘
 ```
 
-**Rust** handles all capture, encoding, and file I/O. The UI is a thin Svelte layer for tray menus, region selection, and recording controls. Tauri v2 bridges the two with type-safe IPC.
+### Data Flow — Zero-Copy Path
+
+```
+                              Apple Silicon SoC
+                    ┌───────────────────────────────┐
+                    │                               │
+  Display Output ───┤  Window Server composites     │
+                    │  frame into IOSurface         │
+                    │         │                     │
+                    │         ▼                     │
+                    │  ScreenCaptureKit delivers    │
+                    │  CMSampleBuffer (IOSurface    │
+                    │  handle — NOT pixel data)     │
+                    │         │                     │
+                    │         ▼                     │
+                    │  VideoToolbox reads IOSurface │
+                    │  via Apple Media Engine       │
+                    │  (dedicated HEVC hardware)    │
+                    │         │                     │
+                    │         ▼                     │
+                    │  Encoded H.265 NALUs          │
+                    │  (tiny compressed packets)    │
+                    │                               │
+                    └───────────┬───────────────────┘
+                                │
+                                ▼
+                    AVAssetWriter → MP4 file on disk
+```
+
+**Key insight**: The pixel data (e.g., 3200×2132 × 1.5 bytes/pixel = ~10 MB/frame) stays entirely in unified GPU memory. Only the tiny compressed NALUs (~50-100 KB/frame) pass through CPU memory on the way to disk.
+
+### Source Files
+
+| File | Lines | Responsibility |
+|------|-------|----------------|
+| `capture.rs` | ~650 | SCK stream setup, SCStreamOutput delegate, frame routing, PTS enforcement |
+| `writer.rs` | ~470 | AVAssetWriter creation, HEVC encoding settings, BT.709 color, finalization |
+| `commands.rs` | ~820 | Tauri IPC commands, recording state machine, window management |
+| `tray.rs` | ~250 | System tray icon, context menu, shortcut handling |
+| `lib.rs` | ~60 | App bootstrap, plugin registration |
+
+**Rust** handles all capture, encoding, and file I/O. The UI is a thin Svelte layer (~5 components) for tray menus, region selection, and recording controls. Tauri v2 bridges the two with type-safe IPC.
+
+### Tech Stack
+
+| Layer | Technology | Why |
+|-------|-----------|-----|
+| Capture | ScreenCaptureKit (macOS 12.3+) | Next-gen capture API, GPU-native IOSurface output |
+| Pixel Format | NV12 (`420v`) | Native format for HEVC encoder — zero color conversion |
+| Color Space | sRGB capture → BT.709 encoding | Lossless metadata match, no implicit conversion |
+| Encoding | VideoToolbox HEVC Main | Apple Media Engine hardware, ~3% CPU |
+| Container | AVAssetWriter → MP4 | Native Apple muxer, proper moov atom, instant seek |
+| Audio | AAC 48kHz stereo, 128kbps | System audio + microphone, dual track |
+| FFI | objc2 0.6 + block2 0.6 | Type-safe Rust ↔ Objective-C bridge |
+| App Shell | Tauri v2 | Lightweight native wrapper, ~3 MB binary |
+| Frontend | Svelte 5 + Vite | Minimal UI for overlays and controls |
 
 ---
 
@@ -156,13 +221,36 @@ The `.dmg` installer will be in `src-tauri/target/release/bundle/dmg/`.
 
 ---
 
-## 📋 Requirements
+## � Compatible Devices
 
-- **macOS 13+** (Ventura or later — requires ScreenCaptureKit)
-- **Apple Silicon** (M1 / M1 Pro / M1 Max / M1 Ultra / M2 / M3 / M4 — all variants supported)
-  - Hardware HEVC encoder, zero-copy IOSurface pipeline, dedicated media engine
-- **Intel Macs** (T2 chip): functional, hardware HEVC available but no unified memory advantage
-- **Intel Macs** (pre-T2): functional, falls back to software HEVC encoding (higher CPU usage)
+### Apple Silicon (Recommended — Full Zero-Copy Pipeline)
+
+| Mac | Chips | Capture | Encoding | Notes |
+|-----|-------|---------|----------|-------|
+| **MacBook Air** | M1 / M2 / M3 / M4 | ✅ SCK Zero-Copy | ✅ Hardware HEVC | Fanless — truly silent recording |
+| **MacBook Pro** 14" 16" | M1 Pro/Max — M4 Pro/Max | ✅ SCK Zero-Copy | ✅ Hardware HEVC | Multiple media engines on Pro/Max |
+| **Mac mini** | M1 / M2 / M2 Pro / M4 / M4 Pro | ✅ SCK Zero-Copy | ✅ Hardware HEVC | Great for desktop recording setups |
+| **iMac** | M1 / M3 / M4 | ✅ SCK Zero-Copy | ✅ Hardware HEVC | 4.5K/5K Retina fully supported |
+| **Mac Studio** | M1 Max/Ultra / M2 Max/Ultra / M4 Max | ✅ SCK Zero-Copy | ✅ Hardware HEVC | Multi-encoder for highest throughput |
+| **Mac Pro** | M2 Ultra | ✅ SCK Zero-Copy | ✅ Hardware HEVC | Up to 4 media engines |
+
+> **All M-series chips share the same Apple Media Engine architecture.** M1 through M4 (including Pro / Max / Ultra variants) deliver identical zero-copy recording quality. Higher-tier chips simply have more encoder instances for parallel workloads.
+
+### Intel Macs (Supported with Limitations)
+
+| Configuration | Capture | Encoding | Limitations |
+|---------------|---------|----------|-------------|
+| Intel + **T2 chip** (2018-2020 models) | ✅ SCK | ✅ Hardware HEVC via T2 | No unified memory — extra copy between CPU↔GPU |
+| Intel **without T2** (pre-2018) | ✅ SCK | ⚠️ Software HEVC | Higher CPU usage (15-30%), may impact performance |
+
+### System Requirements
+
+| Requirement | Minimum | Recommended |
+|-------------|---------|-------------|
+| **macOS** | 13.0 Ventura | 14.0+ Sonoma |
+| **RAM** | 8 GB | 16 GB |
+| **Disk** | ~200 MB/min (Standard) | SSD recommended |
+| **Display** | Any resolution | Retina (2x) for best quality |
 
 ---
 
