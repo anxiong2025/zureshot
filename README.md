@@ -11,9 +11,13 @@
 
 <p align="center">
   <img src="https://img.shields.io/badge/macOS-13%2B-black?logo=apple" alt="macOS 13+">
-  <img src="https://img.shields.io/badge/Apple%20Silicon-Optimized-blue?logo=apple" alt="Apple Silicon">
+  <img src="https://img.shields.io/badge/Apple%20Silicon-M1%20|%20M2%20|%20M3%20|%20M4-blue?logo=apple" alt="Apple Silicon">
   <img src="https://img.shields.io/badge/Codec-HEVC%20H.265-green" alt="HEVC">
   <img src="https://img.shields.io/badge/License-MIT-yellow" alt="MIT">
+</p>
+
+<p align="center">
+  <a href="README.md">English</a> · <a href="README.zh-CN.md">简体中文</a>
 </p>
 
 ---
@@ -155,8 +159,10 @@ The `.dmg` installer will be in `src-tauri/target/release/bundle/dmg/`.
 ## 📋 Requirements
 
 - **macOS 13+** (Ventura or later — requires ScreenCaptureKit)
-- **Apple Silicon** recommended (M1/M2/M3/M4 — hardware HEVC encoder)
-- Intel Macs: works but uses software encoding fallback
+- **Apple Silicon** (M1 / M1 Pro / M1 Max / M1 Ultra / M2 / M3 / M4 — all variants supported)
+  - Hardware HEVC encoder, zero-copy IOSurface pipeline, dedicated media engine
+- **Intel Macs** (T2 chip): functional, hardware HEVC available but no unified memory advantage
+- **Intel Macs** (pre-T2): functional, falls back to software HEVC encoding (higher CPU usage)
 
 ---
 
