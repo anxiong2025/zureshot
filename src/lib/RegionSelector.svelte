@@ -34,8 +34,49 @@
   let aspectLocked = $state(false);
   let aspectRatio = $state(1);   // width / height at the time lock is enabled
   let micEnabled = $state(false);
-  let systemAudioEnabled = $state(false);
+  let systemAudioEnabled = $state(true);
   let selectedQuality = $state('standard'); // 'standard' | 'high'
+
+  // ─── Size presets ───
+  let presetOpen = $state(false);
+  const PRESETS = [
+    { label: 'Landscape 16:9',   w: 1920, h: 1080, icon: '▬' },
+    { label: 'Portrait 9:16',    w: 1080, h: 1920, icon: '▮' },
+    { label: 'Social 4:3',       w: 1080, h: 1440, icon: '▭' },
+    { label: 'Vertical 4:5',     w: 1080, h: 1350, icon: '▯' },
+    { label: 'Square 1:1',       w: 1080, h: 1080, icon: '□' },
+    { label: 'Cinematic 2.35:1', w: 1920, h: 817,  icon: '▬' },
+  ];
+
+  function applyPreset(preset) {
+    const maxW = window.innerWidth;
+    const maxH = window.innerHeight;
+    const dpr = window.devicePixelRatio || 1;
+    // Preset w/h are target OUTPUT pixels. The selection region uses CSS
+    // (logical) pixels, and the backend multiplies by the Retina scale
+    // factor to get the actual recording resolution. So we divide by DPR
+    // to get the correct CSS region size.
+    let pw = Math.round(preset.w / dpr);
+    let ph = Math.round(preset.h / dpr);
+    // If still too large for the screen, scale down to fit
+    if (pw > maxW || ph > maxH) {
+      const scale = Math.min(maxW / pw, maxH / ph) * 0.95;
+      pw = Math.round(pw * scale);
+      ph = Math.round(ph * scale);
+    }
+    // Ensure even dimensions (HEVC requires it after DPR multiplication)
+    pw = pw % 2 !== 0 ? pw + 1 : pw;
+    ph = ph % 2 !== 0 ? ph + 1 : ph;
+    // Center on screen
+    selW = pw;
+    selH = ph;
+    selX = Math.round((maxW - pw) / 2);
+    selY = Math.round((maxH - ph) / 2);
+    // Lock aspect ratio automatically
+    aspectLocked = true;
+    aspectRatio = preset.w / preset.h;
+    presetOpen = false;
+  }
 
   // Editable dimension input values (strings for input binding)
   let inputW = $state('');
@@ -43,12 +84,20 @@
   let inputWFocused = $state(false);
   let inputHFocused = $state(false);
 
-  // Sync inputs from selection rect when not focused
+  // Sync inputs from selection rect when not focused.
+  // Display OUTPUT pixels (physical) = CSS pixels × DPR.
+  // This is what the user cares about — the actual recording resolution.
   $effect(() => {
-    if (!inputWFocused) inputW = String(Math.round(selW));
+    if (!inputWFocused) {
+      const dpr = window.devicePixelRatio || 1;
+      inputW = String(Math.round(selW * dpr));
+    }
   });
   $effect(() => {
-    if (!inputHFocused) inputH = String(Math.round(selH));
+    if (!inputHFocused) {
+      const dpr = window.devicePixelRatio || 1;
+      inputH = String(Math.round(selH * dpr));
+    }
   });
 
   // Live drawing rect (during phase === 'drawing')
@@ -95,6 +144,11 @@
   // ─── Event Handlers ───
 
   function onMouseDown(e) {
+    // Close preset menu on any click outside it
+    if (presetOpen) {
+      presetOpen = false;
+    }
+
     if (phase === 'idle') {
       // Start drawing a new selection
       startX = e.clientX;
@@ -260,9 +314,10 @@
   function onWidthInput(e) {
     inputW = e.target.value;
     const v = parseInt(inputW, 10);
+    const dpr = window.devicePixelRatio || 1;
     if (!isNaN(v) && v >= MIN_SIZE) {
-      const oldW = selW;
-      selW = Math.min(v, window.innerWidth - selX);
+      // User types output pixels → convert to CSS pixels
+      selW = Math.min(Math.round(v / dpr), window.innerWidth - selX);
       if (aspectLocked && aspectRatio > 0) {
         selH = Math.round(selW / aspectRatio);
         selH = Math.min(selH, window.innerHeight - selY);
@@ -273,8 +328,10 @@
   function onHeightInput(e) {
     inputH = e.target.value;
     const v = parseInt(inputH, 10);
+    const dpr = window.devicePixelRatio || 1;
     if (!isNaN(v) && v >= MIN_SIZE) {
-      selH = Math.min(v, window.innerHeight - selY);
+      // User types output pixels → convert to CSS pixels
+      selH = Math.min(Math.round(v / dpr), window.innerHeight - selY);
       if (aspectLocked && aspectRatio > 0) {
         selW = Math.round(selH * aspectRatio);
         selW = Math.min(selW, window.innerWidth - selX);
@@ -328,6 +385,10 @@
     if (e.target.tagName === 'INPUT') return;
 
     if (e.key === 'Escape') {
+      if (presetOpen) {
+        presetOpen = false;
+        return;
+      }
       if (phase === 'adjusting') {
         // Go back to idle
         phase = 'idle';
@@ -374,7 +435,7 @@
         {#if drawRect.width < MIN_SIZE || drawRect.height < MIN_SIZE}
           Fullscreen
         {:else}
-          {Math.round(rect.width)} &times; {Math.round(rect.height)}
+          {Math.round(rect.width * (window.devicePixelRatio || 1))} &times; {Math.round(rect.height * (window.devicePixelRatio || 1))}
         {/if}
       </div>
     {/if}
@@ -397,19 +458,6 @@
       >
         <!-- Row 1: Dimensions + Settings -->
         <div class="toolbar-row toolbar-top">
-          <!-- Settings icon -->
-          <div class="toolbar-icon" title="Region settings">
-            <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
-              <rect x="1" y="1" width="14" height="14" rx="2" stroke="currentColor" stroke-width="1.5" fill="none"/>
-              <line x1="5" y1="1" x2="5" y2="15" stroke="currentColor" stroke-width="1" opacity="0.5"/>
-              <line x1="11" y1="1" x2="11" y2="15" stroke="currentColor" stroke-width="1" opacity="0.5"/>
-              <line x1="1" y1="5" x2="15" y2="5" stroke="currentColor" stroke-width="1" opacity="0.5"/>
-              <line x1="1" y1="11" x2="15" y2="11" stroke="currentColor" stroke-width="1" opacity="0.5"/>
-            </svg>
-          </div>
-
-          <div class="toolbar-sep"></div>
-
           <!-- Width input -->
           <input
             type="text"
@@ -435,25 +483,31 @@
             onkeydown={onHeightKeyDown}
           />
 
-          <!-- Aspect ratio lock -->
-          <button
-            class="toolbar-btn aspect-btn"
-            class:active={aspectLocked}
-            title={aspectLocked ? 'Unlock aspect ratio' : 'Lock aspect ratio'}
-            onclick={toggleAspectLock}
-          >
-            {#if aspectLocked}
-              <svg width="14" height="14" viewBox="0 0 14 14" fill="none">
-                <rect x="2" y="6" width="10" height="7" rx="1.5" stroke="currentColor" stroke-width="1.5" fill="none"/>
-                <path d="M4.5 6V4.5a2.5 2.5 0 015 0V6" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" fill="none"/>
+          <!-- Preset dropdown (opens upward) -->
+          <div class="preset-wrapper">
+            <button
+              class="toolbar-btn preset-btn"
+              class:active={presetOpen}
+              title="Size presets"
+              onclick={(e) => { e.stopPropagation(); presetOpen = !presetOpen; }}
+            >
+              <svg class="chevron-up" class:open={presetOpen} width="10" height="6" viewBox="0 0 10 6" fill="none">
+                <path d="M1 5l4-4 4 4" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/>
               </svg>
-            {:else}
-              <svg width="14" height="14" viewBox="0 0 14 14" fill="none">
-                <rect x="2" y="6" width="10" height="7" rx="1.5" stroke="currentColor" stroke-width="1.5" fill="none"/>
-                <path d="M4.5 6V4.5a2.5 2.5 0 015 0" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" fill="none"/>
-              </svg>
+            </button>
+            {#if presetOpen}
+              <!-- svelte-ignore a11y_no_static_element_interactions -->
+              <div class="preset-menu" onmousedown={(e) => e.stopPropagation()}>
+                {#each PRESETS as preset}
+                  <button class="preset-item" onclick={() => applyPreset(preset)}>
+                    <span class="preset-icon">{preset.icon}</span>
+                    <span class="preset-label">{preset.label}</span>
+                    <span class="preset-size">{preset.w}×{preset.h}</span>
+                  </button>
+                {/each}
+              </div>
             {/if}
-          </button>
+          </div>
 
           <div class="toolbar-sep"></div>
 
@@ -534,14 +588,21 @@
 
           <!-- Record GIF button -->
           <button class="btn-record-gif" onclick={() => confirmSelection('gif')}>
-            <span class="gif-badge">GIF</span>
-            Record GIF
+            <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
+              <rect x="1" y="3" width="14" height="10" rx="2" stroke="currentColor" stroke-width="1.4" fill="none"/>
+              <circle cx="8" cy="8" r="2" stroke="currentColor" stroke-width="1.2" fill="none"/>
+              <path d="M4 6h1M11 6h1" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/>
+            </svg>
+            GIF
           </button>
 
           <!-- Record Video button -->
           <button class="btn-record-video" onclick={() => confirmSelection('video')}>
-            <span class="rec-dot"></span>
-            Record Video
+            <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
+              <rect x="1" y="3.5" width="10" height="9" rx="2" stroke="currentColor" stroke-width="1.4" fill="none"/>
+              <path d="M11 7l4-2.5v7L11 9" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round" fill="none"/>
+            </svg>
+            Video
           </button>
         </div>
       </div>
@@ -841,81 +902,56 @@
   .btn-record-gif {
     display: flex;
     align-items: center;
-    gap: 6px;
-    padding: 6px 14px;
-    border: none;
+    gap: 5px;
+    padding: 5px 12px;
+    border: 1px solid rgba(167, 139, 250, 0.35);
     border-radius: 8px;
-    background: rgba(139, 92, 246, 0.9);
-    color: white;
+    background: rgba(139, 92, 246, 0.15);
+    color: rgba(196, 181, 253, 0.95);
     font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Text', sans-serif;
-    font-size: 13px;
+    font-size: 12px;
     font-weight: 600;
+    letter-spacing: 0.2px;
     cursor: pointer;
     transition: all 0.15s ease;
-    box-shadow: 0 2px 8px rgba(139, 92, 246, 0.3);
     white-space: nowrap;
   }
   .btn-record-gif:hover {
-    background: rgba(124, 58, 237, 1);
-    transform: scale(1.02);
-    box-shadow: 0 3px 12px rgba(139, 92, 246, 0.4);
+    background: rgba(139, 92, 246, 0.28);
+    border-color: rgba(167, 139, 250, 0.55);
+    color: #e0d4ff;
   }
   .btn-record-gif:active {
-    transform: scale(0.98);
-  }
-
-  .gif-badge {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    padding: 1px 4px;
-    border-radius: 3px;
-    background: rgba(255, 255, 255, 0.25);
-    font-size: 9px;
-    font-weight: 800;
-    letter-spacing: 0.5px;
-    line-height: 1.2;
-    flex-shrink: 0;
+    transform: scale(0.97);
+    background: rgba(139, 92, 246, 0.35);
   }
 
   /* Record Video button */
   .btn-record-video {
     display: flex;
     align-items: center;
-    gap: 6px;
-    padding: 6px 16px;
-    border: none;
+    gap: 5px;
+    padding: 5px 14px;
+    border: 1px solid rgba(96, 165, 250, 0.35);
     border-radius: 8px;
-    background: rgba(239, 68, 68, 0.9);
-    color: white;
+    background: rgba(59, 130, 246, 0.18);
+    color: rgba(147, 197, 253, 0.95);
     font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Text', sans-serif;
-    font-size: 13px;
+    font-size: 12px;
     font-weight: 600;
+    letter-spacing: 0.2px;
     cursor: pointer;
     transition: all 0.15s ease;
-    box-shadow: 0 2px 8px rgba(239, 68, 68, 0.3);
     white-space: nowrap;
   }
   .btn-record-video:hover {
-    background: rgba(220, 38, 38, 1);
-    transform: scale(1.02);
-    box-shadow: 0 3px 12px rgba(239, 68, 68, 0.4);
+    background: rgba(59, 130, 246, 0.3);
+    border-color: rgba(96, 165, 250, 0.55);
+    color: #dbeafe;
   }
   .btn-record-video:active {
-    transform: scale(0.98);
-  }
-
-  .rec-dot {
-    width: 8px;
-    height: 8px;
-    border-radius: 50%;
-    background: white;
-    animation: pulse-dot 1.5s ease-in-out infinite;
-    flex-shrink: 0;
-  }
-  @keyframes pulse-dot {
-    0%, 100% { opacity: 1; }
-    50% { opacity: 0.5; }
+    transform: scale(0.97);
+    background: rgba(59, 130, 246, 0.38);
   }
 
   /* ─── Crosshair (idle) ─── */
@@ -983,5 +1019,96 @@
     border-radius: 8px;
     backdrop-filter: blur(8px);
     -webkit-backdrop-filter: blur(8px);
+  }
+
+  /* ─── Preset dropdown ─── */
+  .preset-wrapper {
+    position: relative;
+  }
+
+  .preset-btn {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 24px;
+    height: 24px;
+    padding: 0;
+  }
+  .preset-btn.active {
+    color: rgba(59, 130, 246, 0.9);
+    background: rgba(59, 130, 246, 0.12);
+  }
+
+  .chevron-up {
+    transition: transform 0.15s ease;
+  }
+  .chevron-up.open {
+    transform: rotate(180deg);
+  }
+
+  .preset-menu {
+    position: absolute;
+    bottom: calc(100% + 8px);
+    left: 50%;
+    transform: translateX(-50%);
+    min-width: 230px;
+    background: rgba(30, 30, 30, 0.95);
+    backdrop-filter: blur(20px);
+    -webkit-backdrop-filter: blur(20px);
+    border: 1px solid rgba(255, 255, 255, 0.12);
+    border-radius: 10px;
+    box-shadow:
+      0 -4px 32px rgba(0, 0, 0, 0.5),
+      0 -1px 8px rgba(0, 0, 0, 0.3);
+    padding: 4px;
+    z-index: 100;
+    animation: preset-in 0.15s ease-out;
+  }
+  @keyframes preset-in {
+    from { opacity: 0; transform: translateX(-50%) translateY(4px); }
+    to   { opacity: 1; transform: translateX(-50%) translateY(0); }
+  }
+
+  .preset-item {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    width: 100%;
+    padding: 7px 10px;
+    border: none;
+    border-radius: 7px;
+    background: transparent;
+    color: rgba(255, 255, 255, 0.85);
+    font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Text', sans-serif;
+    font-size: 12px;
+    cursor: pointer;
+    transition: background 0.1s ease;
+    text-align: left;
+  }
+  .preset-item:hover {
+    background: rgba(255, 255, 255, 0.1);
+  }
+  .preset-item:active {
+    background: rgba(59, 130, 246, 0.2);
+  }
+
+  .preset-icon {
+    width: 18px;
+    text-align: center;
+    font-size: 14px;
+    color: rgba(255, 255, 255, 0.5);
+    flex-shrink: 0;
+  }
+
+  .preset-label {
+    flex: 1;
+    font-weight: 500;
+  }
+
+  .preset-size {
+    font-family: ui-monospace, 'SF Mono', 'Menlo', monospace;
+    font-size: 11px;
+    color: rgba(255, 255, 255, 0.4);
+    flex-shrink: 0;
   }
 </style>

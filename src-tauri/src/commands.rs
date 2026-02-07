@@ -207,11 +207,18 @@ pub fn do_start_recording(
             eprintln!("[zureshot] {}", e);
             e
         })?;
-        catch_objc_cmd("addInput(audio)", || unsafe {
-            writer.addInput(&ai);
-        });
-        println!("[zureshot] System audio track added to writer");
-        Some(ai)
+        // Verify writer can accept this input before adding
+        let can_add: bool = unsafe { objc2::msg_send![&*writer, canAddInput: &*ai] };
+        if can_add {
+            catch_objc_cmd("addInput(audio)", || unsafe {
+                writer.addInput(&ai);
+            });
+            println!("[zureshot] System audio track added to writer");
+            Some(ai)
+        } else {
+            eprintln!("[zureshot] WARNING: Writer cannot add system audio input — audio will not be recorded");
+            None
+        }
     } else {
         None
     };
@@ -221,11 +228,17 @@ pub fn do_start_recording(
             eprintln!("[zureshot] {}", e);
             e
         })?;
-        catch_objc_cmd("addInput(mic)", || unsafe {
-            writer.addInput(&mi);
-        });
-        println!("[zureshot] Microphone track added to writer");
-        Some(mi)
+        let can_add: bool = unsafe { objc2::msg_send![&*writer, canAddInput: &*mi] };
+        if can_add {
+            catch_objc_cmd("addInput(mic)", || unsafe {
+                writer.addInput(&mi);
+            });
+            println!("[zureshot] Microphone track added to writer");
+            Some(mi)
+        } else {
+            eprintln!("[zureshot] WARNING: Writer cannot add microphone input — mic will not be recorded");
+            None
+        }
     } else {
         None
     };
@@ -278,7 +291,13 @@ pub fn do_start_recording(
     recording.output_format = output_format.unwrap_or_else(|| "video".to_string());
     recording.paused_flag = Some(paused_flag);
 
-    println!("[zureshot] Recording started!");
+    println!(
+        "[zureshot] Recording started! systemAudio={}, mic={}, audioInput={}, micInput={}",
+        capture_system_audio,
+        capture_microphone,
+        recording.audio_input.is_some(),
+        recording.mic_input.is_some()
+    );
 
     // Switch tray icon to recording state (red dot + Stop enabled)
     crate::tray::notify_recording_started(app);

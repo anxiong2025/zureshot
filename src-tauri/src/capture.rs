@@ -66,6 +66,10 @@ pub struct StreamOutputIvars {
     error_logged: AtomicBool,
     frame_count: AtomicU64,
     dropped_count: AtomicU64,
+    /// Audio frames successfully appended
+    audio_frame_count: AtomicU64,
+    /// Audio frames dropped (not ready, invalid, or append failed)
+    audio_dropped_count: AtomicU64,
     /// Last appended PTS value (numerator) — for monotonicity enforcement.
     /// Stored as i64; -1 means "no frame yet".
     last_pts_value: AtomicI64,
@@ -110,13 +114,13 @@ define_class!(
             if output_type.0 == 1 {
                 // System audio
                 if let Some(ref audio_input) = ivars.audio_input {
-                    self.append_audio(sample_buffer, audio_input, ivars);
+                    self.append_audio(sample_buffer, audio_input, ivars, "system");
                 }
                 return;
             } else if output_type.0 == 2 {
                 // Microphone
                 if let Some(ref mic_input) = ivars.mic_input {
-                    self.append_audio(sample_buffer, mic_input, ivars);
+                    self.append_audio(sample_buffer, mic_input, ivars, "mic");
                 }
                 return;
             }
@@ -241,40 +245,119 @@ impl StreamOutputIvars {
         // Print progress every 60 frames (~1 second at 60fps)
         if (n + 1) % 60 == 0 {
             let dropped = self.dropped_count.load(Ordering::Relaxed);
-            println!("[zureshot] Frames: {} | Dropped: {}", n + 1, dropped);
+            let audio = self.audio_frame_count.load(Ordering::Relaxed);
+            let audio_drop = self.audio_dropped_count.load(Ordering::Relaxed);
+            println!(
+                "[zureshot] Frames: {} | Dropped: {} | Audio: {} | AudioDrop: {}",
+                n + 1, dropped, audio, audio_drop
+            );
         }
     }
 
     fn dropped_inc(&self) {
         self.dropped_count.fetch_add(1, Ordering::Relaxed);
     }
+
+    fn audio_frames_inc(&self) {
+        self.audio_frame_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn audio_dropped_inc(&self) {
+        self.audio_dropped_count.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 impl StreamOutput {
     /// Append an audio CMSampleBuffer to the given AVAssetWriterInput.
+    ///
+    /// Used for both system audio (type=1) and microphone (type=2).
+    /// Each source has its own AVAssetWriterInput with independent PTS timeline,
+    /// so we do NOT enforce PTS monotonicity here (unlike video frames).
+    /// AVAssetWriter handles interleaving of multiple audio tracks correctly.
     fn append_audio(
         &self,
         sample_buffer: &CMSampleBuffer,
         audio_input: &AVAssetWriterInput,
         ivars: &StreamOutputIvars,
+        source_label: &str,
     ) {
         let is_valid: bool = unsafe { sample_buffer.is_valid() };
-        if !is_valid { return; }
+        if !is_valid {
+            ivars.audio_dropped_inc();
+            return;
+        }
         let data_ready: bool = unsafe { sample_buffer.data_is_ready() };
-        if !data_ready { return; }
+        if !data_ready {
+            ivars.audio_dropped_inc();
+            return;
+        }
 
-        // Start session on first valid frame (video or audio, whichever comes first)
+        // ── Get PTS and basic validation ──
+        let pts = unsafe { sample_buffer.presentation_time_stamp() };
+        let pts_value = pts.value;
+        let pts_timescale = pts.timescale;
+        if pts_value <= 0 || pts_timescale <= 0 {
+            ivars.audio_dropped_inc();
+            return;
+        }
+
+        // ── Start session on first valid frame (video or audio, whichever comes first) ──
         if !ivars.session_started.swap(true, Ordering::Relaxed) {
-            let pts = unsafe { sample_buffer.presentation_time_stamp() };
             unsafe {
                 let _: () = msg_send![&*ivars.writer, startSessionAtSourceTime: pts];
             }
+            println!(
+                "[zureshot] Session started from {} audio frame, PTS={}/{}",
+                source_label, pts_value, pts_timescale
+            );
+        }
+
+        // ── Log first audio frame for debugging ──
+        let audio_count = ivars.audio_frame_count.load(Ordering::Relaxed);
+        if audio_count == 0 {
+            println!(
+                "[zureshot] First {} audio sample received, PTS={}/{}",
+                source_label, pts_value, pts_timescale
+            );
         }
 
         unsafe {
             let ready: bool = msg_send![audio_input, isReadyForMoreMediaData];
             if ready {
-                let _ok: bool = msg_send![audio_input, appendSampleBuffer: sample_buffer];
+                let ok: bool = msg_send![audio_input, appendSampleBuffer: sample_buffer];
+                if ok {
+                    ivars.audio_frames_inc();
+                } else {
+                    // Audio append failed — log error details
+                    let drop_n = ivars.audio_dropped_count.load(Ordering::Relaxed);
+                    if drop_n < 5 {
+                        let status: i64 = msg_send![&*ivars.writer, status];
+                        let error: Option<Retained<NSError>> = msg_send![&*ivars.writer, error];
+                        let err_desc = error.as_ref()
+                            .map(|e| format!("{}", e))
+                            .unwrap_or_else(|| "unknown".into());
+                        println!(
+                            "[zureshot] !! {} audio appendSampleBuffer FAILED (#{}) !!",
+                            source_label, drop_n + 1
+                        );
+                        println!("[zureshot]    writer status={}", status);
+                        println!("[zureshot]    error={}", err_desc);
+                        println!(
+                            "[zureshot]    audio PTS={}/{}",
+                            pts_value, pts_timescale
+                        );
+                    }
+                    ivars.audio_dropped_inc();
+                }
+            } else {
+                // Audio input not ready — encoder backlogged
+                let drop_n = ivars.audio_dropped_count.fetch_add(1, Ordering::Relaxed);
+                if drop_n < 3 {
+                    println!(
+                        "[zureshot] {} audio input not ready for more data (drop #{})",
+                        source_label, drop_n + 1
+                    );
+                }
             }
         }
     }
@@ -295,6 +378,8 @@ impl StreamOutput {
             error_logged: AtomicBool::new(false),
             frame_count: AtomicU64::new(0),
             dropped_count: AtomicU64::new(0),
+            audio_frame_count: AtomicU64::new(0),
+            audio_dropped_count: AtomicU64::new(0),
             last_pts_value: AtomicI64::new(-1),
             last_pts_timescale: AtomicI64::new(0),
             pts_skip_count: AtomicU64::new(0),
@@ -510,16 +595,24 @@ pub fn create_and_start(
         }
 
         // ── Audio capture ──
+        // Always set sample rate and channel count when any audio is enabled.
+        // Defaults are 48kHz/2ch, but being explicit avoids ambiguity.
+        if capture_system_audio || capture_microphone {
+            c.setSampleRate(48000);
+            c.setChannelCount(2);
+        }
         if capture_system_audio {
             c.setCapturesAudio(true);
             c.setExcludesCurrentProcessAudio(true);
-            c.setSampleRate(48000);
-            c.setChannelCount(2);
-            println!("[zureshot] System audio capture enabled (48kHz stereo)");
+            println!("[zureshot] System audio capture enabled (48kHz stereo, excludesSelf=true)");
         }
         if capture_microphone {
+            // captureMicrophone requires macOS 14+
+            // On Mac Mini there may be no built-in microphone — SCK will use
+            // the default audio input device (e.g. headset mic, USB mic, etc.)
+            // If no mic is available, SCK may silently skip mic samples.
             c.setCaptureMicrophone(true);
-            println!("[zureshot] Microphone capture enabled");
+            println!("[zureshot] Microphone capture enabled (uses default input device)");
         }
 
         c

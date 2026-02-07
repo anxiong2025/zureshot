@@ -10,8 +10,12 @@ use tauri::{
 use crate::commands;
 use crate::commands::RecordingState;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 const TRAY_ID: &str = "zureshot-tray";
+
+/// Guard against double-quit: once set, further quit requests are ignored.
+static QUITTING: AtomicBool = AtomicBool::new(false);
 
 /// Load tray icon from bundled resources
 fn load_tray_icon(app: &AppHandle, recording: bool) -> Result<Image<'static>, Box<dyn std::error::Error>> {
@@ -211,6 +215,20 @@ fn handle_menu_event(app: &AppHandle, id: &str) {
             let _ = std::process::Command::new("open").arg(&zureshot_dir).spawn();
         }
         "quit" => {
+            // Guard: ignore if already quitting (prevents double-click race)
+            if QUITTING.swap(true, Ordering::SeqCst) {
+                return; // Already in quit sequence
+            }
+
+            // Close any open windows (region-selector, recording-bar, overlay)
+            // before starting the quit sequence. These windows don't hold
+            // critical state — they just need to be torn down cleanly.
+            for label in ["region-selector", "recording-bar", "recording-overlay"] {
+                if let Some(win) = app.get_webview_window(label) {
+                    let _ = win.destroy();
+                }
+            }
+
             // If recording is in progress, finalize it before quitting.
             // Must run on a background thread — GCD completion handlers
             // may need the main run loop to deliver callbacks.
@@ -221,12 +239,18 @@ fn handle_menu_event(app: &AppHandle, id: &str) {
             if is_recording {
                 let app = app.clone();
                 std::thread::spawn(move || {
-                    match commands::do_stop_recording(&app) {
-                        Ok(r) => println!(
+                    // Use catch_unwind so app.exit(0) always runs even if
+                    // do_stop_recording panics (e.g. mutex poisoned).
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        commands::do_stop_recording(&app)
+                    }));
+                    match result {
+                        Ok(Ok(r)) => println!(
                             "[zureshot] Recording finalized before quit: {} ({:.1}s)",
                             r.path, r.duration_secs
                         ),
-                        Err(e) => eprintln!("[zureshot] Error finalizing on quit: {}", e),
+                        Ok(Err(e)) => eprintln!("[zureshot] Error finalizing on quit: {}", e),
+                        Err(_) => eprintln!("[zureshot] PANIC during finalize on quit"),
                     }
                     app.exit(0);
                 });
