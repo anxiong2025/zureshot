@@ -126,10 +126,12 @@ pub fn do_start_recording(
     // Generate output path if not provided
     let path = output_path.unwrap_or_else(|| {
         let timestamp = chrono::Local::now().format("%Y%m%d_%H%M%S");
-        let downloads = dirs::download_dir()
+        let base = dirs::download_dir()
             .or_else(dirs::home_dir)
             .unwrap_or_else(|| std::path::PathBuf::from("."));
-        downloads
+        let zureshot_dir = base.join("Zureshot");
+        let _ = std::fs::create_dir_all(&zureshot_dir);
+        zureshot_dir
             .join(format!("zureshot_{}.mp4", timestamp))
             .to_string_lossy()
             .to_string()
@@ -403,6 +405,10 @@ pub fn do_stop_recording(app: &AppHandle) -> Result<RecordingResult, String> {
         file_size as f64 / 1_048_576.0
     );
 
+    // Update tray menu to reflect stopped state
+    // (handles case where stop was triggered from recording bar, not tray)
+    crate::tray::notify_recording_stopped(app);
+
     Ok(result)
 }
 
@@ -482,11 +488,12 @@ pub async fn reveal_in_finder(path: String) -> Result<(), String> {
 /// Get the default recordings directory
 #[tauri::command]
 pub fn get_recordings_dir() -> String {
-    dirs::download_dir()
+    let base = dirs::download_dir()
         .or_else(dirs::home_dir)
-        .unwrap_or_else(|| std::path::PathBuf::from("."))
-        .to_string_lossy()
-        .to_string()
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let zureshot_dir = base.join("Zureshot");
+    let _ = std::fs::create_dir_all(&zureshot_dir);
+    zureshot_dir.to_string_lossy().to_string()
 }
 
 /// Core logic to open the region selector overlay (callable from both tray and commands)
@@ -564,7 +571,7 @@ pub async fn start_region_selection(app: AppHandle) -> Result<(), String> {
 
 /// Confirm region selection and start recording with the selected region
 #[tauri::command]
-pub async fn confirm_region_selection(
+pub fn confirm_region_selection(
     app: AppHandle,
     x: f64,
     y: f64,
@@ -574,10 +581,9 @@ pub async fn confirm_region_selection(
     system_audio: Option<bool>,
     microphone: Option<bool>,
 ) -> Result<(), String> {
-    // Destroy the region selector overlay (destroy fully removes the webview,
-    // unlike close() which is async and may leave the label registered briefly)
+    // Hide the region selector (don't destroy — we're inside its IPC call).
     if let Some(win) = app.get_webview_window("region-selector") {
-        let _ = win.destroy();
+        let _ = win.hide();
     }
 
     let region = CaptureRegion {
@@ -595,32 +601,37 @@ pub async fn confirm_region_selection(
     let sys_audio = system_audio.unwrap_or(false);
     let mic = microphone.unwrap_or(false);
 
-    // Start recording on a dedicated OS thread.
-    // Small delay to let the overlay window fully disappear so it
-    // doesn't get captured in the first frame.
     let region_for_bar = region.clone();
     let region_for_overlay = region.clone();
     let app_clone = app.clone();
-    tokio::task::spawn_blocking(move || {
+    std::thread::spawn(move || {
+        // Small delay to let the region selector fully disappear
         std::thread::sleep(std::time::Duration::from_millis(300));
-        do_start_recording(&app_clone, None, Some(region), q, sys_audio, mic)?;
 
-        // Open the dim overlay and floating control bar
-        let _ = do_open_recording_overlay(&app_clone, &region_for_overlay);
-        let _ = do_open_recording_bar(&app_clone, Some(&region_for_bar));
+        // Now safe to destroy region-selector
+        if let Some(win) = app_clone.get_webview_window("region-selector") {
+            let _ = win.destroy();
+        }
 
-        // Brief delay for windows to register with WindowServer,
-        // then refresh the stream filter to exclude them from capture
-        std::thread::sleep(std::time::Duration::from_millis(150));
-        let _ = refresh_stream_exclusion(&app_clone);
+        match do_start_recording(&app_clone, None, Some(region), q, sys_audio, mic) {
+            Ok(_) => {
+                // Open the dim overlay and floating control bar
+                let _ = do_open_recording_overlay(&app_clone, &region_for_overlay);
+                let _ = do_open_recording_bar(&app_clone, Some(&region_for_bar));
 
-        // Send region coordinates to the overlay for the dim effect
-        let _ = app_clone.emit("recording-region", &region_for_overlay);
+                // Brief delay for windows to register with WindowServer,
+                // then refresh the stream filter to exclude them from capture
+                std::thread::sleep(std::time::Duration::from_millis(150));
+                let _ = refresh_stream_exclusion(&app_clone);
 
-        Ok(())
-    })
-    .await
-    .map_err(|e| format!("Task join error: {e}"))?
+                // Send region coordinates to the overlay for the dim effect
+                let _ = app_clone.emit("recording-region", &region_for_overlay);
+            }
+            Err(e) => eprintln!("[zureshot] Start error: {}", e),
+        }
+    });
+
+    Ok(())
 }
 
 /// Cancel region selection without starting recording

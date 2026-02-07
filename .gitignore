@@ -2,3 +2,4 @@
 /dist
 /node_modules
 /src-tauri/target
+src-tauri/.DS_Store

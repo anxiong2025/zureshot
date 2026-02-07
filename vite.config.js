@@ -26,6 +26,7 @@ export default defineConfig({
         'region-selector': resolve(__dirname, 'region-selector.html'),
         'recording-bar': resolve(__dirname, 'recording-bar.html'),
         'recording-overlay': resolve(__dirname, 'recording-overlay.html'),
+        countdown: resolve(__dirname, 'countdown.html'),
       },
     },
   },

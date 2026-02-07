@@ -22,19 +22,12 @@ pub fn main() {
             // Setup tray icon
             tray::setup_tray(app.handle())?;
 
-            // Create a hidden main window to host frontend JS
-            // (needed for event listening and recording indicator)
-            let _main_window = tauri::WebviewWindowBuilder::new(
-                app,
-                "main",
-                tauri::WebviewUrl::App("index.html".into()),
-            )
-            .title("Zureshot")
-            .inner_size(1.0, 1.0)
-            .resizable(false)
-            .visible(false)
-            .skip_taskbar(true)
-            .build()?;
+            // Hide the Dock icon — pure menu-bar app
+            #[cfg(target_os = "macos")]
+            {
+                use tauri::ActivationPolicy;
+                app.set_activation_policy(ActivationPolicy::Accessory);
+            }
 
             println!("[zureshot] App started, tray icon ready");
             println!("[zureshot] Click tray icon or use menu to start recording");
@@ -53,6 +46,14 @@ pub fn main() {
             commands::pause_recording,
             commands::resume_recording,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        // Tray-only app: use .build() + .run() to intercept ExitRequested.
+        // This prevents Tauri from quitting when all windows are destroyed.
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|_app_handle, event| {
+            if let tauri::RunEvent::ExitRequested { api, .. } = event {
+                // Keep the app alive — only explicit app.exit(0) can quit
+                api.prevent_exit();
+            }
+        });
 }
