@@ -1,0 +1,685 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Zureshot — Pixel-perfect Screen Recording for Mac</title>
+  <meta name="description" content="Zureshot: Zero-copy GPU screen recorder for macOS. HEVC H.265, 3.9MB installer, 3% CPU usage. Free and open source. Built with Rust.">
+  <meta name="keywords" content="screen recorder, mac, macos, screen recording, hevc, h265, rust, tauri, apple silicon, gif recorder, free, open source">
+  <meta name="author" content="Zureshot">
+  <meta name="theme-color" content="#000000">
+  <link rel="icon" type="image/png" href="../src-tauri/icons/32x32.png">
+
+  <!-- Open Graph -->
+  <meta property="og:type" content="website">
+  <meta property="og:title" content="Zureshot — Pixel-perfect Screen Recording for Mac">
+  <meta property="og:description" content="Zero-copy GPU pipeline. HEVC encoding. 3.9MB installer. Free and open source.">
+  <meta property="og:url" content="https://anxiong2025.github.io/zureshot/">
+  <meta property="og:site_name" content="Zureshot">
+
+  <!-- Twitter Card -->
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:title" content="Zureshot — Pixel-perfect Screen Recording for Mac">
+  <meta name="twitter:description" content="Zero-copy GPU pipeline. HEVC encoding. 3.9MB installer. Free and open source.">
+
+  <!-- Structured Data -->
+  <script type="application/ld+json">
+  {
+    "@context": "https://schema.org",
+    "@type": "SoftwareApplication",
+    "name": "Zureshot",
+    "operatingSystem": "macOS",
+    "applicationCategory": "MultimediaApplication",
+    "offers": { "@type": "Offer", "price": "0", "priceCurrency": "USD" },
+    "description": "Pixel-perfect screen recording for Mac. Zero-copy GPU pipeline, HEVC H.265, built with Rust.",
+    "softwareVersion": "0.2.0",
+    "fileSize": "3.9MB",
+    "downloadUrl": "https://github.com/anxiong2025/zureshot/releases/latest"
+  }
+  </script>
+
+  <style>
+    /* ═══ Reset & Base ═══ */
+    *, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
+
+    :root {
+      --bg: #000000;
+      --bg-card: #111113;
+      --bg-card-hover: #1a1a1e;
+      --text: #f5f5f7;
+      --text-secondary: #86868b;
+      --text-dim: #6e6e73;
+      --accent: #2997ff;
+      --accent-hover: #0077ed;
+      --purple: #8b5cf6;
+      --green: #30d158;
+      --red: #ff453a;
+      --orange: #ff9f0a;
+      --border: rgba(255,255,255,0.08);
+      --font: -apple-system, BlinkMacSystemFont, 'SF Pro Display', 'SF Pro Text', 'Helvetica Neue', sans-serif;
+      --mono: ui-monospace, 'SF Mono', 'Fira Code', 'Fira Mono', 'Roboto Mono', monospace;
+    }
+
+    html { scroll-behavior: smooth; }
+    body {
+      font-family: var(--font);
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.6;
+      -webkit-font-smoothing: antialiased;
+      overflow-x: hidden;
+    }
+    a { color: var(--accent); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+
+    /* ═══ Layout ═══ */
+    .container { max-width: 980px; margin: 0 auto; padding: 0 24px; }
+    section { padding: 100px 0; }
+
+    /* ═══ Navigation ═══ */
+    nav {
+      position: fixed; top: 0; left: 0; right: 0; z-index: 100;
+      background: rgba(0,0,0,0.72);
+      backdrop-filter: saturate(180%) blur(20px);
+      -webkit-backdrop-filter: saturate(180%) blur(20px);
+      border-bottom: 1px solid var(--border);
+    }
+    nav .container {
+      display: flex; align-items: center; justify-content: space-between;
+      height: 48px;
+    }
+    .nav-brand {
+      font-size: 18px; font-weight: 700; color: var(--text);
+      display: flex; align-items: center; gap: 8px;
+    }
+    .nav-brand img { width: 24px; height: 24px; border-radius: 5px; }
+    .nav-links { display: flex; gap: 28px; align-items: center; }
+    .nav-links a {
+      font-size: 13px; color: var(--text-secondary);
+      transition: color 0.2s;
+    }
+    .nav-links a:hover { color: var(--text); text-decoration: none; }
+    .nav-links .btn-nav {
+      background: var(--accent); color: white !important;
+      padding: 6px 16px; border-radius: 18px;
+      font-size: 12px; font-weight: 600;
+      transition: background 0.2s;
+    }
+    .nav-links .btn-nav:hover { background: var(--accent-hover); }
+
+    /* ═══ Hero ═══ */
+    .hero {
+      padding: 160px 0 100px;
+      text-align: center;
+    }
+    .hero-badge {
+      display: inline-flex; align-items: center; gap: 6px;
+      padding: 4px 14px;
+      background: rgba(139,92,246,0.12);
+      border: 1px solid rgba(139,92,246,0.25);
+      border-radius: 20px;
+      font-size: 13px; font-weight: 500;
+      color: var(--purple);
+      margin-bottom: 24px;
+    }
+    .hero h1 {
+      font-size: clamp(48px, 8vw, 80px);
+      font-weight: 700;
+      letter-spacing: -0.03em;
+      line-height: 1.05;
+      margin-bottom: 20px;
+    }
+    .hero h1 .gradient {
+      background: linear-gradient(135deg, #2997ff 0%, #8b5cf6 50%, #ff453a 100%);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      background-clip: text;
+    }
+    .hero-sub {
+      font-size: clamp(18px, 2.5vw, 24px);
+      color: var(--text-secondary);
+      max-width: 600px;
+      margin: 0 auto 40px;
+      line-height: 1.5;
+    }
+    .hero-actions {
+      display: flex; gap: 16px;
+      justify-content: center; flex-wrap: wrap;
+      margin-bottom: 48px;
+    }
+    .btn-primary {
+      display: inline-flex; align-items: center; gap: 8px;
+      padding: 14px 32px;
+      background: var(--accent);
+      color: white; font-size: 17px; font-weight: 600;
+      border-radius: 12px; border: none; cursor: pointer;
+      transition: all 0.2s;
+    }
+    .btn-primary:hover { background: var(--accent-hover); transform: translateY(-1px); text-decoration: none; }
+    .btn-secondary {
+      display: inline-flex; align-items: center; gap: 8px;
+      padding: 14px 32px;
+      background: transparent;
+      color: var(--accent); font-size: 17px; font-weight: 600;
+      border-radius: 12px; border: 1px solid rgba(41,151,255,0.3);
+      cursor: pointer; transition: all 0.2s;
+    }
+    .btn-secondary:hover { background: rgba(41,151,255,0.08); text-decoration: none; }
+    .hero-stats {
+      display: flex; justify-content: center; gap: 48px; flex-wrap: wrap;
+    }
+    .stat { text-align: center; }
+    .stat-value {
+      font-size: 36px; font-weight: 700;
+      font-family: var(--mono);
+    }
+    .stat-label {
+      font-size: 13px; color: var(--text-dim);
+      margin-top: 4px;
+    }
+    .stat-value.blue { color: var(--accent); }
+    .stat-value.green { color: var(--green); }
+    .stat-value.purple { color: var(--purple); }
+    .stat-value.orange { color: var(--orange); }
+
+    /* ═══ Brand Story ═══ */
+    .brand {
+      text-align: center;
+      padding: 80px 0;
+      border-top: 1px solid var(--border);
+      border-bottom: 1px solid var(--border);
+    }
+    .brand-equation {
+      font-size: clamp(28px, 5vw, 48px);
+      font-weight: 700;
+      font-family: var(--mono);
+      letter-spacing: -0.02em;
+      margin-bottom: 40px;
+    }
+    .brand-equation .z { color: var(--accent); }
+    .brand-equation .p { color: var(--purple); }
+    .brand-equation .s { color: var(--red); }
+    .brand-equation .dim { color: var(--text-dim); }
+    .brand-words {
+      display: flex; justify-content: center; gap: 48px; flex-wrap: wrap;
+      max-width: 800px; margin: 0 auto;
+    }
+    .brand-word { text-align: center; max-width: 220px; }
+    .brand-word h3 {
+      font-size: 20px; font-weight: 700; margin-bottom: 8px;
+    }
+    .brand-word p {
+      font-size: 15px; color: var(--text-secondary); line-height: 1.5;
+    }
+
+    /* ═══ Comparison Table ═══ */
+    .comparison { text-align: center; }
+    .comparison h2 {
+      font-size: clamp(32px, 5vw, 48px);
+      font-weight: 700; margin-bottom: 12px;
+    }
+    .comparison .subtitle {
+      font-size: 18px; color: var(--text-secondary);
+      margin-bottom: 48px;
+    }
+    .table-wrap {
+      overflow-x: auto; -webkit-overflow-scrolling: touch;
+    }
+    table {
+      width: 100%; border-collapse: collapse;
+      font-size: 15px;
+    }
+    thead th {
+      padding: 16px 20px;
+      font-size: 13px; font-weight: 600;
+      text-transform: uppercase; letter-spacing: 0.5px;
+      color: var(--text-dim);
+      border-bottom: 1px solid var(--border);
+      text-align: left;
+    }
+    thead th:first-child { text-align: left; }
+    thead th:nth-child(2) { color: var(--accent); }
+    tbody td {
+      padding: 14px 20px;
+      border-bottom: 1px solid var(--border);
+      text-align: left;
+    }
+    tbody td:first-child {
+      font-weight: 500; color: var(--text-secondary);
+    }
+    tbody td:nth-child(2) {
+      font-weight: 600; color: var(--text);
+      font-family: var(--mono); font-size: 14px;
+    }
+    tbody td:nth-child(3) {
+      color: var(--text-dim);
+      font-family: var(--mono); font-size: 14px;
+    }
+    .winner { color: var(--green) !important; }
+    .badge-mult {
+      display: inline-block;
+      padding: 2px 8px;
+      background: rgba(48,209,88,0.12);
+      color: var(--green);
+      border-radius: 6px;
+      font-size: 11px; font-weight: 700;
+      margin-left: 8px;
+    }
+
+    /* ═══ Features Grid ═══ */
+    .features { text-align: center; }
+    .features h2 {
+      font-size: clamp(32px, 5vw, 48px);
+      font-weight: 700; margin-bottom: 48px;
+    }
+    .features-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+      gap: 20px; text-align: left;
+    }
+    .feature-card {
+      padding: 28px;
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      transition: all 0.25s;
+    }
+    .feature-card:hover {
+      background: var(--bg-card-hover);
+      border-color: rgba(255,255,255,0.12);
+      transform: translateY(-2px);
+    }
+    .feature-icon {
+      font-size: 28px; margin-bottom: 12px;
+    }
+    .feature-card h3 {
+      font-size: 17px; font-weight: 600; margin-bottom: 8px;
+    }
+    .feature-card p {
+      font-size: 14px; color: var(--text-secondary); line-height: 1.6;
+    }
+
+    /* ═══ Pipeline ═══ */
+    .pipeline { text-align: center; }
+    .pipeline h2 {
+      font-size: clamp(32px, 5vw, 48px);
+      font-weight: 700; margin-bottom: 12px;
+    }
+    .pipeline .subtitle {
+      font-size: 18px; color: var(--text-secondary);
+      margin-bottom: 48px;
+    }
+    .pipeline-diagram {
+      display: flex; align-items: center; justify-content: center;
+      gap: 0; flex-wrap: wrap;
+      padding: 40px 20px;
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: 20px;
+      max-width: 800px; margin: 0 auto;
+    }
+    .pipe-node {
+      padding: 12px 20px;
+      border-radius: 10px;
+      font-family: var(--mono);
+      font-size: 13px; font-weight: 600;
+      white-space: nowrap;
+    }
+    .pipe-arrow {
+      color: var(--text-dim); font-size: 20px;
+      padding: 0 8px;
+    }
+    .pipe-sck { background: rgba(41,151,255,0.15); color: var(--accent); }
+    .pipe-gpu { background: rgba(139,92,246,0.15); color: var(--purple); }
+    .pipe-vtb { background: rgba(48,209,88,0.15); color: var(--green); }
+    .pipe-mp4 { background: rgba(255,159,10,0.15); color: var(--orange); }
+    .pipe-labels {
+      display: flex; justify-content: center; gap: 40px;
+      margin-top: 20px; flex-wrap: wrap;
+    }
+    .pipe-label {
+      font-size: 12px; color: var(--text-dim);
+      display: flex; align-items: center; gap: 6px;
+    }
+    .pipe-label .dot {
+      width: 8px; height: 8px; border-radius: 50%;
+    }
+    .pipe-label .dot.blue { background: var(--accent); }
+    .pipe-label .dot.purple { background: var(--purple); }
+    .pipe-label .dot.green { background: var(--green); }
+
+    /* ═══ Download CTA ═══ */
+    .download {
+      text-align: center;
+      padding: 120px 0;
+    }
+    .download h2 {
+      font-size: clamp(32px, 5vw, 48px);
+      font-weight: 700; margin-bottom: 12px;
+    }
+    .download .subtitle {
+      font-size: 18px; color: var(--text-secondary);
+      margin-bottom: 40px;
+    }
+    .download-info {
+      display: flex; justify-content: center; gap: 32px; flex-wrap: wrap;
+      margin-top: 24px;
+    }
+    .download-info span {
+      font-size: 13px; color: var(--text-dim);
+      display: flex; align-items: center; gap: 6px;
+    }
+
+    /* ═══ Footer ═══ */
+    footer {
+      padding: 40px 0;
+      border-top: 1px solid var(--border);
+      text-align: center;
+    }
+    footer p {
+      font-size: 13px; color: var(--text-dim);
+    }
+    footer a { color: var(--text-secondary); }
+    footer .footer-links {
+      display: flex; justify-content: center; gap: 24px;
+      margin-bottom: 16px;
+    }
+
+    /* ═══ Animations ═══ */
+    .fade-in {
+      opacity: 0; transform: translateY(20px);
+      transition: opacity 0.6s ease, transform 0.6s ease;
+    }
+    .fade-in.visible {
+      opacity: 1; transform: translateY(0);
+    }
+
+    /* ═══ Responsive ═══ */
+    @media (max-width: 640px) {
+      section { padding: 64px 0; }
+      .hero { padding: 120px 0 64px; }
+      .hero-stats { gap: 24px; }
+      .stat-value { font-size: 28px; }
+      .brand-words { gap: 24px; }
+      .nav-links a:not(.btn-nav) { display: none; }
+      .pipe-arrow { padding: 0 4px; font-size: 16px; }
+      .pipe-node { padding: 8px 12px; font-size: 11px; }
+    }
+  </style>
+</head>
+<body>
+
+<!-- Navigation -->
+<nav>
+  <div class="container">
+    <a href="#" class="nav-brand">
+      <img src="../src-tauri/icons/32x32.png" alt="Zureshot" onerror="this.style.display='none'">
+      Zureshot
+    </a>
+    <div class="nav-links">
+      <a href="#features">Features</a>
+      <a href="#comparison">Compare</a>
+      <a href="#pipeline">Tech</a>
+      <a href="https://github.com/anxiong2025/zureshot" target="_blank">GitHub</a>
+      <a href="https://github.com/anxiong2025/zureshot/releases/latest" class="btn-nav">Download</a>
+    </div>
+  </div>
+</nav>
+
+<!-- Hero -->
+<section class="hero">
+  <div class="container">
+    <div class="hero-badge">✨ v0.2.0 — Now with GIF recording</div>
+    <h1>Screen recording.<br><span class="gradient">Invisible.</span></h1>
+    <p class="hero-sub">
+      Pixel-perfect capture for Mac. Zero-copy GPU pipeline.<br>
+      Your Mac won't even notice it's running.
+    </p>
+    <div class="hero-actions">
+      <a href="https://github.com/anxiong2025/zureshot/releases/latest" class="btn-primary">
+        ↓ Download for Mac
+      </a>
+      <a href="https://github.com/anxiong2025/zureshot" class="btn-secondary" target="_blank">
+        View on GitHub
+      </a>
+    </div>
+    <div class="hero-stats">
+      <div class="stat">
+        <div class="stat-value blue">3.9<span style="font-size:20px">MB</span></div>
+        <div class="stat-label">Installer size</div>
+      </div>
+      <div class="stat">
+        <div class="stat-value green">3<span style="font-size:20px">%</span></div>
+        <div class="stat-label">CPU while recording</div>
+      </div>
+      <div class="stat">
+        <div class="stat-value purple">~50<span style="font-size:20px">MB</span></div>
+        <div class="stat-label">Memory usage</div>
+      </div>
+      <div class="stat">
+        <div class="stat-value orange">$0</div>
+        <div class="stat-label">Free &amp; open source</div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- Brand Story -->
+<section class="brand">
+  <div class="container">
+    <div class="brand-equation">
+      <span class="z">Z</span><span class="dim">ero</span>
+      <span class="dim"> + </span>
+      <span class="p">Pure</span>
+      <span class="dim"> + </span>
+      <span class="s">Shot</span>
+    </div>
+    <div class="brand-words">
+      <div class="brand-word">
+        <h3 style="color:var(--accent)">Zero</h3>
+        <p>Zero-copy GPU pipeline. CPU never touches pixel data. 3% usage — invisible.</p>
+      </div>
+      <div class="brand-word">
+        <h3 style="color:var(--purple)">Pure</h3>
+        <p>Pure Rust. No Electron bloat. 3.9 MB installer, 11 MB on disk. Nothing wasted.</p>
+      </div>
+      <div class="brand-word">
+        <h3 style="color:var(--red)">Shot</h3>
+        <p>One shot, instant capture. Click to record. Done. The best tool is one you don't notice.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- Comparison -->
+<section class="comparison" id="comparison">
+  <div class="container">
+    <h2 class="fade-in">How we compare</h2>
+    <p class="subtitle fade-in">Real numbers. No marketing fluff.</p>
+    <div class="table-wrap fade-in">
+      <table>
+        <thead>
+          <tr>
+            <th>Metric</th>
+            <th>Zureshot</th>
+            <th>CleanShot X</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Installer size</td>
+            <td class="winner">3.9 MB <span class="badge-mult">18×</span></td>
+            <td>~70 MB</td>
+          </tr>
+          <tr>
+            <td>App on disk</td>
+            <td class="winner">11 MB <span class="badge-mult">14×</span></td>
+            <td>~150 MB</td>
+          </tr>
+          <tr>
+            <td>Memory (recording)</td>
+            <td class="winner">~50 MB <span class="badge-mult">8×</span></td>
+            <td>300–500 MB</td>
+          </tr>
+          <tr>
+            <td>CPU usage</td>
+            <td class="winner">~3% <span class="badge-mult">8×</span></td>
+            <td>15–25%</td>
+          </tr>
+          <tr>
+            <td>Video codec</td>
+            <td class="winner">HEVC H.265</td>
+            <td>H.264</td>
+          </tr>
+          <tr>
+            <td>30s video size</td>
+            <td class="winner">~13 MB <span class="badge-mult">65%</span></td>
+            <td>~37 MB</td>
+          </tr>
+          <tr>
+            <td>Resolution</td>
+            <td class="winner">Native Retina</td>
+            <td>Logical pixels</td>
+          </tr>
+          <tr>
+            <td>Color pipeline</td>
+            <td class="winner">BT.709 precise</td>
+            <td>Undisclosed</td>
+          </tr>
+          <tr>
+            <td>Price</td>
+            <td class="winner">Free &amp; open source</td>
+            <td>$29</td>
+          </tr>
+          <tr>
+            <td>Tech stack</td>
+            <td>Rust + Tauri</td>
+            <td>Closed source</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+</section>
+
+<!-- Features -->
+<section class="features" id="features">
+  <div class="container">
+    <h2 class="fade-in">Everything you need</h2>
+    <div class="features-grid">
+      <div class="feature-card fade-in">
+        <div class="feature-icon">🎯</div>
+        <h3>True Retina Recording</h3>
+        <p>Captures at native physical pixels — 3200×2132, not 1600×1066. Every pixel, every frame.</p>
+      </div>
+      <div class="feature-card fade-in">
+        <div class="feature-icon">🎞️</div>
+        <h3>GIF Recording</h3>
+        <p>Record GIF with two-pass palette optimization. 30s max, 640px, 15fps. Auto-stop with countdown.</p>
+      </div>
+      <div class="feature-card fade-in">
+        <div class="feature-icon">🔲</div>
+        <h3>Region Selection</h3>
+        <p>Click for fullscreen or drag to select any area. Resize handles, dimension inputs, aspect lock.</p>
+      </div>
+      <div class="feature-card fade-in">
+        <div class="feature-icon">⚡</div>
+        <h3>HEVC H.265</h3>
+        <p>Hardware-accelerated encoding via Apple Media Engine. 40–50% smaller files than H.264.</p>
+      </div>
+      <div class="feature-card fade-in">
+        <div class="feature-icon">🔊</div>
+        <h3>System Audio + Mic</h3>
+        <p>Capture app sounds and microphone as separate AAC tracks. Hardware-encoded, 48kHz stereo.</p>
+      </div>
+      <div class="feature-card fade-in">
+        <div class="feature-icon">🎨</div>
+        <h3>Color-Accurate</h3>
+        <p>Full BT.709 color pipeline — sRGB capture, correct gamma, precise YCbCr. Colors match your screen.</p>
+      </div>
+      <div class="feature-card fade-in">
+        <div class="feature-icon">⏸</div>
+        <h3>Pause / Resume</h3>
+        <p>Zero-overhead atomic flag. No encoding gaps, no glitches. Pause and resume seamlessly.</p>
+      </div>
+      <div class="feature-card fade-in">
+        <div class="feature-icon">🖱</div>
+        <h3>Tray-Only App</h3>
+        <p>Lives in your menu bar. Click tray icon for instant access. ⌘⇧R to record anytime.</p>
+      </div>
+      <div class="feature-card fade-in">
+        <div class="feature-icon">🧊</div>
+        <h3>Silent Operation</h3>
+        <p>~3% CPU, ~50MB RAM. No fan noise. No battery drain. Your Mac stays cool.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- Pipeline -->
+<section class="pipeline" id="pipeline">
+  <div class="container">
+    <h2 class="fade-in">Zero-copy GPU pipeline</h2>
+    <p class="subtitle fade-in">Pixel data never enters your app's memory. Ever.</p>
+    <div class="pipeline-diagram fade-in">
+      <span class="pipe-node pipe-sck">ScreenCaptureKit</span>
+      <span class="pipe-arrow">→</span>
+      <span class="pipe-node pipe-gpu">IOSurface (GPU)</span>
+      <span class="pipe-arrow">→</span>
+      <span class="pipe-node pipe-vtb">VideoToolbox HEVC</span>
+      <span class="pipe-arrow">→</span>
+      <span class="pipe-node pipe-mp4">MP4</span>
+    </div>
+    <div class="pipe-labels fade-in">
+      <span class="pipe-label"><span class="dot blue"></span> macOS capture</span>
+      <span class="pipe-label"><span class="dot purple"></span> GPU memory — zero CPU copy</span>
+      <span class="pipe-label"><span class="dot green"></span> Hardware encoder</span>
+    </div>
+  </div>
+</section>
+
+<!-- Download CTA -->
+<section class="download" id="download">
+  <div class="container">
+    <h2 class="fade-in">Ready to record?</h2>
+    <p class="subtitle fade-in">Download Zureshot. It takes 3 seconds to install.</p>
+    <a href="https://github.com/anxiong2025/zureshot/releases/latest" class="btn-primary fade-in" style="font-size:20px; padding:18px 40px;">
+      ↓ Download v0.2.0
+    </a>
+    <div class="download-info fade-in">
+      <span>🍎 macOS 12.3+</span>
+      <span>🔋 Apple Silicon (M1–M4)</span>
+      <span>📦 3.9 MB DMG</span>
+      <span>⚖️ MIT License</span>
+    </div>
+  </div>
+</section>
+
+<!-- Footer -->
+<footer>
+  <div class="container">
+    <div class="footer-links">
+      <a href="https://github.com/anxiong2025/zureshot" target="_blank">GitHub</a>
+      <a href="https://github.com/anxiong2025/zureshot/releases" target="_blank">Releases</a>
+      <a href="https://github.com/anxiong2025/zureshot/issues" target="_blank">Issues</a>
+      <a href="https://github.com/anxiong2025/zureshot/blob/main/LICENSE" target="_blank">MIT License</a>
+    </div>
+    <p>Zureshot — Zero + Pure + Shot. Built with Rust and ❤️</p>
+  </div>
+</footer>
+
+<!-- Scroll Animation -->
+<script>
+  const observer = new IntersectionObserver((entries) => {
+    entries.forEach(entry => {
+      if (entry.isIntersecting) {
+        entry.target.classList.add('visible');
+      }
+    });
+  }, { threshold: 0.1 });
+
+  document.querySelectorAll('.fade-in').forEach(el => observer.observe(el));
+</script>
+
+</body>
+</html>
