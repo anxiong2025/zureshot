@@ -1,17 +1,3 @@
-[package]
-name = "zureshot"
-version = "0.1.0"
-edition = "2024"
-
-[dependencies]
-objc2 = { version = "0.6", features = ["exception"] }
-objc2-foundation = "0.3"
-objc2-screen-capture-kit = "0.3"
-objc2-core-media = "0.3"
-objc2-core-video = "0.3"
-objc2-av-foundation = "0.3"
-objc2-core-graphics = "0.3"
-objc2-core-foundation = "0.3"
-block2 = "0.6"
-dispatch2 = "0.3"
-libc = "0.2"
+[workspace]
+members = ["src-tauri"]
+resolver = "2"

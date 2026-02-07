@@ -6,7 +6,7 @@
 //!
 //! No CPU-side pixel copying in the entire path.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::mpsc;
 
 use block2::RcBlock;
@@ -17,7 +17,7 @@ use objc2::runtime::NSObjectProtocol;
 use objc2::{define_class, msg_send, AllocAnyThread, DefinedClass};
 use objc2_av_foundation::{AVAssetWriter, AVAssetWriterInput};
 use objc2_core_media::CMSampleBuffer;
-use objc2_foundation::{NSArray, NSError};
+use objc2_foundation::{NSArray, NSError, NSString};
 use objc2_screen_capture_kit::{
     SCContentFilter, SCDisplay, SCShareableContent, SCStream, SCStreamConfiguration,
     SCStreamOutput, SCStreamOutputType, SCWindow,
@@ -32,8 +32,16 @@ pub struct StreamOutputIvars {
     writer: Retained<AVAssetWriter>,
     input: Retained<AVAssetWriterInput>,
     session_started: AtomicBool,
+    error_logged: AtomicBool,
     frame_count: AtomicU64,
     dropped_count: AtomicU64,
+    /// Last appended PTS value (numerator) — for monotonicity enforcement.
+    /// Stored as i64; -1 means "no frame yet".
+    last_pts_value: AtomicI64,
+    /// Last appended PTS timescale — for monotonicity enforcement.
+    last_pts_timescale: AtomicI64,
+    /// Count of frames skipped due to non-monotonic PTS.
+    pts_skip_count: AtomicU64,
 }
 
 define_class!(
@@ -59,22 +67,110 @@ define_class!(
         ) {
             let ivars = self.ivars();
 
-            // Start the AVAssetWriter session on the very first frame.
-            // The session start time must match the first sample's PTS.
+            // ── 1. Validate CMSampleBuffer ──
+            let is_valid: bool = unsafe { sample_buffer.is_valid() };
+            if !is_valid {
+                ivars.dropped_inc();
+                return;
+            }
+            let data_ready: bool = unsafe {
+                sample_buffer.data_is_ready()
+            };
+            if !data_ready {
+                ivars.dropped_inc();
+                return;
+            }
+
+            // ── 1b. Skip non-video frames ──
+            // ScreenCaptureKit sends status/info frames (Started, Idle, Blank, etc.)
+            // that pass is_valid/data_is_ready but contain no pixel data.
+            // Appending these to AVAssetWriter puts it in a permanent failed state.
+            let has_image = unsafe { sample_buffer.image_buffer() };
+            if has_image.is_none() {
+                return;
+            }
+
+            // ── 2. Get PTS and enforce monotonicity ──
+            let pts = unsafe { sample_buffer.presentation_time_stamp() };
+            // Copy packed struct fields to local variables (CMTime is repr(packed))
+            let pts_value = pts.value;
+            let pts_timescale = pts.timescale;
+            // Skip frames with invalid timestamps
+            if pts_value <= 0 || pts_timescale <= 0 {
+                ivars.dropped_inc();
+                return;
+            }
+            // Check strictly increasing PTS (compare as rational numbers)
+            let prev_val = ivars.last_pts_value.load(Ordering::Relaxed);
+            let prev_ts = ivars.last_pts_timescale.load(Ordering::Relaxed);
+            if prev_val >= 0 && prev_ts > 0 {
+                // Compare: pts_value/pts_timescale > prev_val/prev_ts
+                // Cross-multiply to avoid floating point:
+                let lhs = (pts_value as i128) * (prev_ts as i128);
+                let rhs = (prev_val as i128) * (pts_timescale as i128);
+                if lhs <= rhs {
+                    // Non-monotonic PTS — skip this frame
+                    let skip_n = ivars.pts_skip_count.fetch_add(1, Ordering::Relaxed);
+                    if skip_n < 5 || skip_n % 100 == 0 {
+                        println!(
+                            "[zureshot] Skipping non-monotonic PTS: {}/{} <= {}/{} (skip #{})",
+                            pts_value, pts_timescale, prev_val, prev_ts, skip_n + 1
+                        );
+                    }
+                    ivars.dropped_inc();
+                    return;
+                }
+            }
+
+            // ── 3. Start session on first valid frame ──
             if !ivars.session_started.swap(true, Ordering::Relaxed) {
-                let pts = unsafe { sample_buffer.presentation_time_stamp() };
                 unsafe {
                     let _: () = msg_send![&*ivars.writer, startSessionAtSourceTime: pts];
                 }
-                eprintln!("[zureshot] First frame captured, encoding started");
+                println!(
+                    "[zureshot] First frame captured, PTS={}/{}, encoding started",
+                    pts_value, pts_timescale
+                );
             }
 
-            // Zero-copy append: CMSampleBuffer (IOSurface) → VideoToolbox encoder
+            // ── 4. Append frame to writer (zero-copy) ──
             unsafe {
                 let ready: bool = msg_send![&*ivars.input, isReadyForMoreMediaData];
                 if ready {
-                    let _: bool = msg_send![&*ivars.input, appendSampleBuffer: sample_buffer];
-                    ivars.frames_inc();
+                    let ok: bool = msg_send![&*ivars.input, appendSampleBuffer: sample_buffer];
+                    if ok {
+                        // Update last PTS
+                        ivars.last_pts_value.store(pts_value, Ordering::Relaxed);
+                        ivars.last_pts_timescale.store(pts_timescale as i64, Ordering::Relaxed);
+                        ivars.frames_inc();
+                    } else {
+                        // Writer entered failed state — log full error ONCE
+                        if !ivars.error_logged.swap(true, Ordering::Relaxed) {
+                            let status: i64 = msg_send![&*ivars.writer, status];
+                            let error: Option<Retained<NSError>> = msg_send![&*ivars.writer, error];
+                            let err_desc = error.as_ref()
+                                .map(|e| format!("{}", e))
+                                .unwrap_or_else(|| "unknown".into());
+                            let err_domain: Option<Retained<NSString>> = error.as_ref()
+                                .map(|e| e.domain());
+                            let err_code: i64 = error.as_ref()
+                                .map(|e| e.code() as i64)
+                                .unwrap_or(-1);
+                            let err_info_str = error.as_ref()
+                                .map(|e| format!("{:?}", e.userInfo()))
+                                .unwrap_or_else(|| "none".into());
+                            println!("[zureshot] !! Writer FAILED at frame {} !!",
+                                ivars.frame_count.load(Ordering::Relaxed));
+                            println!("[zureshot]    status={}", status);
+                            println!("[zureshot]    error={}", err_desc);
+                            println!("[zureshot]    domain={:?} code={}",
+                                err_domain.as_ref().map(|d| d.to_string()), err_code);
+                            println!("[zureshot]    userInfo={}", err_info_str);
+                            println!("[zureshot]    last PTS={}/{} current PTS={}/{}",
+                                prev_val, prev_ts, pts_value, pts_timescale);
+                        }
+                        ivars.dropped_inc();
+                    }
                 } else {
                     ivars.dropped_inc();
                 }
@@ -89,7 +185,7 @@ impl StreamOutputIvars {
         // Print progress every 60 frames (~1 second at 60fps)
         if (n + 1) % 60 == 0 {
             let dropped = self.dropped_count.load(Ordering::Relaxed);
-            eprint!("\r[zureshot] Frames: {} | Dropped: {}    ", n + 1, dropped);
+            println!("[zureshot] Frames: {} | Dropped: {}", n + 1, dropped);
         }
     }
 
@@ -107,8 +203,12 @@ impl StreamOutput {
             writer,
             input,
             session_started: AtomicBool::new(false),
+            error_logged: AtomicBool::new(false),
             frame_count: AtomicU64::new(0),
             dropped_count: AtomicU64::new(0),
+            last_pts_value: AtomicI64::new(-1),
+            last_pts_timescale: AtomicI64::new(0),
+            pts_skip_count: AtomicU64::new(0),
         });
         unsafe { msg_send![super(this), init] }
     }
@@ -128,7 +228,7 @@ impl StreamOutput {
 
 /// Get the main display via ScreenCaptureKit.
 /// Blocks until the system returns available shareable content.
-pub fn get_main_display() -> Retained<SCDisplay> {
+pub fn get_main_display() -> Result<Retained<SCDisplay>, String> {
     let (tx, rx) = mpsc::channel();
 
     let handler = RcBlock::new(
@@ -151,20 +251,22 @@ pub fn get_main_display() -> Retained<SCDisplay> {
 
     let content = rx
         .recv()
-        .expect("SCShareableContent channel closed")
-        .unwrap_or_else(|e| {
-            eprintln!("[zureshot] ERROR: {}", e);
-            eprintln!("[zureshot] Screen Recording permission required.");
-            eprintln!("[zureshot] → System Settings > Privacy & Security > Screen Recording");
-            eprintln!("[zureshot] → Enable your terminal app, then restart it.");
-            std::process::exit(1);
-        });
+        .map_err(|_| "SCShareableContent channel closed".to_string())?
+        .map_err(|e| {
+            format!(
+                "Screen Recording permission denied. \
+                 → System Settings > Privacy & Security > Screen Recording \
+                 → Enable Zureshot, then restart the app. ({})",
+                e
+            )
+        })?;
 
     let displays = unsafe { content.displays() };
-    assert!(!displays.is_empty(), "No displays found");
+    if displays.is_empty() {
+        return Err("No displays found".to_string());
+    }
 
-    // Return the first (main) display — objectAtIndex returns Retained
-    displays.objectAtIndex(0)
+    Ok(displays.objectAtIndex(0))
 }
 
 /// Get the pixel dimensions of a display.
@@ -186,8 +288,11 @@ pub fn create_and_start(
     height: usize,
     writer: Retained<AVAssetWriter>,
     input: Retained<AVAssetWriterInput>,
-) -> Retained<SCStream> {
+) -> Result<Retained<SCStream>, String> {
     // ── Stream configuration ──
+    // H.264 requires even dimensions — round up if needed (must match writer settings)
+    let width = if width % 2 != 0 { width + 1 } else { width };
+    let height = if height % 2 != 0 { height + 1 } else { height };
     let config = unsafe {
         let c = SCStreamConfiguration::new();
         c.setWidth(width);
@@ -195,8 +300,10 @@ pub fn create_and_start(
         // 60 fps — minimumFrameInterval is the minimum time between frames
         c.setMinimumFrameInterval(CMTime::new(1, 60));
         c.setShowsCursor(true);
-        // BGRA pixel format — universally supported, hardware encoder handles conversion
-        c.setPixelFormat(u32::from_be_bytes(*b"BGRA"));
+        // NV12 (420v) pixel format — native format for H.264 encoding
+        // BGRA requires GPU color space conversion which can fail after a few seconds.
+        // 420v is what the VideoToolbox H.264 encoder natively consumes → zero-copy.
+        c.setPixelFormat(u32::from_be_bytes(*b"420v"));
         // Queue depth: keep 5 frames max in the capture queue (backpressure)
         c.setQueueDepth(5);
         c
@@ -251,15 +358,15 @@ pub fn create_and_start(
         stream.startCaptureWithCompletionHandler(Some(&start_handler));
     }
     rx.recv()
-        .unwrap()
-        .expect("Failed to start capture");
+        .map_err(|_| "Capture start channel closed".to_string())?
+        .map_err(|e| format!("Failed to start capture: {}", e))?;
 
     // The stream retains the delegate via addStreamOutput.
     // We must NOT drop the Rust Retained<StreamOutput> early though,
     // as that would decrement the refcount. Leak it — the stream owns it now.
     std::mem::forget(delegate);
 
-    stream
+    Ok(stream)
 }
 
 /// Stop the capture stream (blocking wait).
@@ -279,7 +386,7 @@ pub fn stop(stream: &SCStream) {
     // Allow timeout — if capture already stopped, don't hang
     match rx.recv_timeout(std::time::Duration::from_secs(5)) {
         Ok(Ok(())) => {}
-        Ok(Err(e)) => eprintln!("[zureshot] Warning: stop capture error: {}", e),
-        Err(_) => eprintln!("[zureshot] Warning: stop capture timed out"),
+        Ok(Err(e)) => println!("[zureshot] Warning: stop capture error: {}", e),
+        Err(_) => println!("[zureshot] Warning: stop capture timed out"),
     }
 }

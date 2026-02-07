@@ -17,19 +17,24 @@ use block2::RcBlock;
 use objc2::rc::Retained;
 use objc2::runtime::AnyObject;
 use objc2::{class, msg_send};
-use objc2_av_foundation::{AVAssetWriter, AVAssetWriterInput};
-use objc2_foundation::{NSError, NSString};
+use objc2_av_foundation::{
+    AVAssetWriter, AVAssetWriterInput,
+    AVVideoCodecKey, AVVideoWidthKey, AVVideoHeightKey,
+    AVVideoCompressionPropertiesKey, AVVideoAverageBitRateKey,
+    AVVideoMaxKeyFrameIntervalKey, AVVideoProfileLevelKey,
+    AVVideoExpectedSourceFrameRateKey, AVVideoProfileLevelH264HighAutoLevel,
+    AVVideoCodecTypeH264, AVVideoAllowFrameReorderingKey,
+};
+use objc2_foundation::{NSError, NSString, NSNumber};
 
-/// Catch ObjC exceptions and panic with a readable message.
-fn catch_objc<R>(context: &str, f: impl FnOnce() -> R) -> R {
+/// Catch ObjC exceptions and return Result instead of panicking.
+fn catch_objc<R>(context: &str, f: impl FnOnce() -> R) -> Result<R, String> {
     use std::panic::AssertUnwindSafe;
-    // SAFETY: We assert unwind safety here because ObjC exceptions are used
-    // only for programming errors (invalid arguments), not for recoverable errors.
-    objc2::exception::catch(AssertUnwindSafe(f)).unwrap_or_else(|e| {
+    objc2::exception::catch(AssertUnwindSafe(f)).map_err(|e| {
         let desc = e
             .map(|ex| format!("{ex}"))
             .unwrap_or_else(|| "unknown ObjC exception".into());
-        panic!("[zureshot] ObjC exception in {}: {}", context, desc);
+        format!("[zureshot] ObjC exception in {}: {}", context, desc)
     })
 }
 
@@ -41,7 +46,7 @@ pub fn create_writer(
     output_path: &str,
     width: usize,
     height: usize,
-) -> (Retained<AVAssetWriter>, Retained<AVAssetWriterInput>) {
+) -> Result<(Retained<AVAssetWriter>, Retained<AVAssetWriterInput>), String> {
     // Resolve to absolute path (AVAssetWriter requires it)
     let abs_path = std::path::Path::new(output_path);
     let abs_path = if abs_path.is_absolute() {
@@ -71,17 +76,17 @@ pub fn create_writer(
             ]
         };
         match result {
-            Some(w) => w,
+            Some(w) => Ok(w),
             None => {
                 let err = if !error_ptr.is_null() {
                     unsafe { format!("{}", &*error_ptr) }
                 } else {
                     "unknown error".to_string()
                 };
-                panic!("Failed to create AVAssetWriter: {}", err);
+                Err(format!("Failed to create AVAssetWriter: {}", err))
             }
         }
-    });
+    })??;
 
     // Video encoding settings (H.264 High Profile, VBR)
     let settings = create_video_settings(width, height);
@@ -97,7 +102,7 @@ pub fn create_writer(
                 assetWriterInputWithMediaType: &*media_type,
                 outputSettings: &*settings
             ]
-        });
+        })?;
 
     // Critical for screen recording: real-time mode keeps memory low
     // by not accumulating too many frames in the encoding pipeline
@@ -112,26 +117,51 @@ pub fn create_writer(
             writer.startWriting(),
             "AVAssetWriter failed to start writing"
         );
-    });
+    })?;
 
-    eprintln!(
+    println!(
         "[zureshot] Writer ready: H.264 {}x{} → {}",
         width, height, output_str
     );
-    (writer, input)
+    Ok((writer, input))
 }
 
 /// Finalize the recording: mark input as finished, complete the MP4 file.
 ///
 /// This writes the moov atom and closes the file. The MP4 is not playable
 /// until this completes successfully.
+///
+/// IMPORTANT: The caller MUST NOT hold any Mutex that Tauri sync commands
+/// also acquire — GCD completion handlers may need the main thread, and
+/// blocking it causes a deadlock where the moov atom is never written.
 pub fn finalize(writer: &AVAssetWriter, input: &AVAssetWriterInput) {
+    // Check writer status before finalizing
+    let status_before = unsafe { writer.status() };
+    println!(
+        "[zureshot] Finalize: writer status = {} (0=Unknown, 1=Writing, 2=Completed, 3=Failed, 4=Cancelled)",
+        status_before.0
+    );
+
+    if status_before.0 == 3 {
+        let err = unsafe { writer.error() };
+        let err_str = err.map(|e| format!("{}", e)).unwrap_or_default();
+        println!("[zureshot] ERROR: Writer already in failed state: {}", err_str);
+        return;
+    }
+    if status_before.0 != 1 {
+        println!("[zureshot] ERROR: Writer not in Writing state, cannot finalize");
+        return;
+    }
+
+    println!("[zureshot] Finalize: marking input as finished...");
     unsafe {
         input.markAsFinished();
     }
 
+    println!("[zureshot] Finalize: calling finishWritingWithCompletionHandler...");
     let (tx, rx) = mpsc::channel();
     let handler = RcBlock::new(move || {
+        println!("[zureshot] Finalize: completion handler fired!");
         let _ = tx.send(());
     });
 
@@ -139,23 +169,52 @@ pub fn finalize(writer: &AVAssetWriter, input: &AVAssetWriterInput) {
         writer.finishWritingWithCompletionHandler(&handler);
     }
 
-    // Wait for finalization (usually < 1 second)
-    match rx.recv_timeout(std::time::Duration::from_secs(30)) {
-        Ok(()) => {
-            let status = unsafe { writer.status() };
-            if status.0 != 2 {
-                // AVAssetWriterStatusCompleted = 2
-                let err = unsafe { writer.error() };
-                let err_str = err.map(|e| format!("{}", e)).unwrap_or_default();
-                eprintln!(
-                    "[zureshot] Warning: writer status {} — {}",
-                    status.0, err_str
-                );
+    // Wait for completion, polling writer status as fallback.
+    // The completion handler may not fire if GCD encounters scheduling issues,
+    // but the writer status will still transition. Poll every 500ms to detect this.
+    let start = std::time::Instant::now();
+    let timeout = std::time::Duration::from_secs(15);
+
+    loop {
+        match rx.recv_timeout(std::time::Duration::from_millis(500)) {
+            Ok(()) => break,
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                println!("[zureshot] Finalize: channel disconnected unexpectedly");
+                break;
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                // Poll writer status — it may have completed without the handler firing
+                let status = unsafe { writer.status() };
+                if status.0 != 1 {
+                    println!(
+                        "[zureshot] Finalize: writer status changed to {} (detected via poll)",
+                        status.0
+                    );
+                    break;
+                }
+                if start.elapsed() > timeout {
+                    println!(
+                        "[zureshot] Finalize: TIMEOUT ({:.0}s) — writer still in status {}",
+                        timeout.as_secs_f64(),
+                        status.0
+                    );
+                    break;
+                }
             }
         }
-        Err(_) => {
-            eprintln!("[zureshot] Warning: finishWriting timed out (30s)");
-        }
+    }
+
+    // Report final status
+    let final_status = unsafe { writer.status() };
+    if final_status.0 == 2 {
+        println!("[zureshot] Finalize: SUCCESS — moov atom written");
+    } else {
+        let err = unsafe { writer.error() };
+        let err_str = err.map(|e| format!("{}", e)).unwrap_or_default();
+        println!(
+            "[zureshot] Finalize: FAILED — status={}, error={}",
+            final_status.0, err_str
+        );
     }
 }
 
@@ -174,60 +233,62 @@ fn create_video_settings(width: usize, height: usize) -> Retained<AnyObject> {
         let dict: Retained<AnyObject> = msg_send![class!(NSMutableDictionary), new];
 
         // ── AVVideoCodecKey: H.264 ──
-        dict_set(&dict, "AVVideoCodecKey", &*NSString::from_str("avc1"));
+        let codec_key = AVVideoCodecKey.expect("AVVideoCodecKey not available");
+        let codec_val = AVVideoCodecTypeH264.expect("AVVideoCodecTypeH264 not available");
+        dict_set_nsstring(&dict, codec_key, codec_val);
 
         // ── AVVideoWidthKey / AVVideoHeightKey ──
         // H.264 requires even dimensions — round up if needed
         let w = if width % 2 != 0 { width + 1 } else { width };
         let h = if height % 2 != 0 { height + 1 } else { height };
-        let width_num: Retained<AnyObject> =
-            msg_send![class!(NSNumber), numberWithInteger: w as isize];
-        let height_num: Retained<AnyObject> =
-            msg_send![class!(NSNumber), numberWithInteger: h as isize];
-        dict_set(&dict, "AVVideoWidthKey", &*width_num);
-        dict_set(&dict, "AVVideoHeightKey", &*height_num);
+        let width_key = AVVideoWidthKey.expect("AVVideoWidthKey not available");
+        let height_key = AVVideoHeightKey.expect("AVVideoHeightKey not available");
+        let width_num = NSNumber::new_isize(w as isize);
+        let height_num = NSNumber::new_isize(h as isize);
+        dict_set_nsstring(&dict, width_key, &width_num);
+        dict_set_nsstring(&dict, height_key, &height_num);
 
         // ── AVVideoCompressionPropertiesKey: encoding parameters ──
         let comp: Retained<AnyObject> = msg_send![class!(NSMutableDictionary), new];
 
         // Adaptive bitrate based on resolution
         let bitrate = compute_bitrate(width, height);
+        let bitrate_key = AVVideoAverageBitRateKey.expect("AVVideoAverageBitRateKey not available");
         let bitrate_num: Retained<AnyObject> =
             msg_send![class!(NSNumber), numberWithLongLong: bitrate];
-        dict_set(&comp, "AVVideoAverageBitRateKey", &*bitrate_num);
+        dict_set_nsstring(&comp, bitrate_key, &bitrate_num);
 
         // Max keyframe interval: 60 frames = 1 second at 60fps
         // Enables precise editing (cut at any 1-second boundary)
-        let keyframe_num: Retained<AnyObject> =
-            msg_send![class!(NSNumber), numberWithInteger: 60_isize];
-        dict_set(&comp, "AVVideoMaxKeyFrameIntervalKey", &*keyframe_num);
+        let keyframe_key = AVVideoMaxKeyFrameIntervalKey.expect("AVVideoMaxKeyFrameIntervalKey not available");
+        let keyframe_num = NSNumber::new_isize(60);
+        dict_set_nsstring(&comp, keyframe_key, &keyframe_num);
 
         // H.264 High Profile — best quality/compression ratio
-        dict_set(
-            &comp,
-            "AVVideoProfileLevelKey",
-            &*NSString::from_str("H264_High_AutoLevel"),
-        );
+        let profile_key = AVVideoProfileLevelKey.expect("AVVideoProfileLevelKey not available");
+        let profile_val = AVVideoProfileLevelH264HighAutoLevel.expect("AVVideoProfileLevelH264HighAutoLevel not available");
+        dict_set_nsstring(&comp, profile_key, profile_val);
 
         // Expected source frame rate — helps encoder allocate resources
-        let fps_num: Retained<AnyObject> =
-            msg_send![class!(NSNumber), numberWithInteger: 60_isize];
-        dict_set(&comp, "AVVideoExpectedSourceFrameRateKey", &*fps_num);
+        let fps_key = AVVideoExpectedSourceFrameRateKey.expect("AVVideoExpectedSourceFrameRateKey not available");
+        let fps_num = NSNumber::new_isize(60);
+        dict_set_nsstring(&comp, fps_key, &fps_num);
 
-        // Allow frame reordering: false — lower latency, slightly worse compression
-        let no: Retained<AnyObject> = msg_send![class!(NSNumber), numberWithBool: false];
-        dict_set(&comp, "AVVideoAllowFrameReorderingKey", &*no);
+        // Disable frame reordering for real-time screen recording (lower latency)
+        let reorder_key = AVVideoAllowFrameReorderingKey.expect("AVVideoAllowFrameReorderingKey not available");
+        let no = NSNumber::new_bool(false);
+        dict_set_nsstring(&comp, reorder_key, &no);
 
-        dict_set(&dict, "AVVideoCompressionPropertiesKey", &*comp);
+        let comp_key = AVVideoCompressionPropertiesKey.expect("AVVideoCompressionPropertiesKey not available");
+        dict_set_nsstring(&dict, comp_key, &comp);
 
         dict
     }
 }
 
-/// Helper: set a key-value pair on an NSMutableDictionary via msg_send.
-unsafe fn dict_set(dict: &AnyObject, key: &str, value: &AnyObject) {
-    let key_str = NSString::from_str(key);
-    let () = msg_send![dict, setObject: value, forKey: &*key_str];
+/// Helper: set a key-value pair on an NSMutableDictionary using an NSString key.
+unsafe fn dict_set_nsstring(dict: &AnyObject, key: &NSString, value: &AnyObject) {
+    let () = msg_send![dict, setObject: value, forKey: key];
 }
 
 /// Compute VBR target bitrate based on resolution.

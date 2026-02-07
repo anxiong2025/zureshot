@@ -1,1 +1,4 @@
 /target
+/dist
+/node_modules
+/src-tauri/target
