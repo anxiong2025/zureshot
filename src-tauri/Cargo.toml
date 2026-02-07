@@ -28,7 +28,7 @@ objc2-screen-capture-kit = "0.3"
 objc2-core-media = "0.3"
 objc2-core-video = "0.3"
 objc2-av-foundation = { version = "0.3", features = ["AVVideoSettings", "AVAssetWriter", "AVAssetWriterInput"] }
-objc2-core-graphics = "0.3"
+objc2-core-graphics = { version = "0.3", features = ["CGColorSpace"] }
 objc2-core-foundation = "0.3"
 block2 = "0.6"
 dispatch2 = "0.3"

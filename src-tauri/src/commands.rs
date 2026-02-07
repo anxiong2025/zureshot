@@ -145,41 +145,37 @@ pub fn do_start_recording(
         eprintln!("[zureshot] {}", e);
         e
     })?;
-    let (disp_width, disp_height) = capture::display_size(&display);
-    println!("[zureshot] Display: {}x{}", disp_width, disp_height);
+    let (phys_width, phys_height, retina_scale) = capture::display_physical_size(&display);
+    println!("[zureshot] Display: {}x{} physical, scale={}", phys_width, phys_height, retina_scale);
 
     // Determine output dimensions and source rect
     let (width, height, source_rect) = if let Some(ref rgn) = region {
-        // HiDPI scale factor: pixel width / logical width
-        let display_frame = unsafe { display.frame() };
-        let scale = disp_width as f64 / display_frame.size.width;
-
-        // Always use native Retina resolution for maximum sharpness.
-        // HEVC encoding keeps file sizes small even at full resolution.
-        let pixel_w = (rgn.width * scale) as usize;
-        let pixel_h = (rgn.height * scale) as usize;
+        // Use Retina scale to convert CSS/logical pixels → physical pixels.
+        // Region coordinates from the web UI are in logical (CSS) points.
+        // Output dimensions must be in physical pixels for pixel-perfect sharpness.
+        let pixel_w = (rgn.width * retina_scale) as usize;
+        let pixel_h = (rgn.height * retina_scale) as usize;
         // Ensure even dimensions for HEVC
         let pixel_w = if pixel_w % 2 != 0 { pixel_w + 1 } else { pixel_w };
         let pixel_h = if pixel_h % 2 != 0 { pixel_h + 1 } else { pixel_h };
 
-        // ScreenCaptureKit sourceRect uses top-left origin (Quartz display space),
+        // ScreenCaptureKit sourceRect uses logical points (top-left origin),
         // same as CSS coordinates. No coordinate conversion needed.
         let rect = CGRect::new(
             CGPoint::new(rgn.x, rgn.y),
             CGSize::new(rgn.width, rgn.height),
         );
         println!(
-            "[zureshot] Region: css({},{} {}x{}) → sourceRect({},{} {}x{}) → pixels({}x{}) scale={} quality={:?}",
+            "[zureshot] Region: css({},{} {}x{}) → pixels({}x{}) scale={} quality={:?}",
             rgn.x, rgn.y, rgn.width, rgn.height,
-            rgn.x, rgn.y, rgn.width, rgn.height,
-            pixel_w, pixel_h, scale, quality
+            pixel_w, pixel_h, retina_scale, quality
         );
         (pixel_w, pixel_h, Some(rect))
     } else {
-        // Full screen: always native Retina resolution for both Standard and High.
+        // Full screen: native Retina physical pixels for both Standard and High.
         // Standard vs High only differs in frame rate (30 vs 60 fps).
-        println!("[zureshot] Full screen: {}x{} (native pixels) quality={:?}", disp_width, disp_height, quality);
-        (disp_width, disp_height, None)
+        println!("[zureshot] Full screen: {}x{} (physical, {}x Retina) quality={:?}", phys_width, phys_height, retina_scale, quality);
+        (phys_width, phys_height, None)
     };
 
     // Collect windows to exclude (our own app windows)
@@ -219,6 +215,13 @@ pub fn do_start_recording(
     } else {
         None
     };
+
+    // Start writing AFTER all inputs are added.
+    // AVAssetWriter does not allow adding inputs after startWriting().
+    writer::start_writing(&writer).map_err(|e| {
+        eprintln!("[zureshot] {}", e);
+        e
+    })?;
 
     // Shared paused flag — the capture delegate checks this on every frame
     let paused_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));

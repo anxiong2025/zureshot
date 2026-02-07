@@ -20,9 +20,10 @@ use objc2_core_media::CMSampleBuffer;
 use objc2_foundation::{NSArray, NSError, NSString};
 use objc2_core_foundation::{CGPoint, CGRect, CGSize};
 use objc2_screen_capture_kit::{
-    SCContentFilter, SCDisplay, SCShareableContent, SCStream, SCStreamConfiguration,
-    SCStreamOutput, SCStreamOutputType, SCWindow,
+    SCCaptureResolutionType, SCContentFilter, SCDisplay, SCShareableContent, SCStream,
+    SCStreamConfiguration, SCStreamOutput, SCStreamOutputType, SCWindow,
 };
+use objc2_core_graphics::kCGColorSpaceSRGB;
 use objc2_core_media::CMTime;
 use serde::{Deserialize, Serialize};
 
@@ -376,12 +377,50 @@ pub fn get_display_and_windows() -> Result<(Retained<SCDisplay>, Vec<Retained<SC
     Ok((display, windows))
 }
 
-/// Get the pixel dimensions of a display.
+/// Get the logical pixel dimensions of a display.
 pub fn display_size(display: &SCDisplay) -> (usize, usize) {
     unsafe {
         let w = display.width() as usize;
         let h = display.height() as usize;
         (w, h)
+    }
+}
+
+/// Get the physical pixel dimensions and Retina scale factor of a display.
+///
+/// On Retina displays, physical pixels = logical × scale (e.g., 3200×2132 = 1600×1066 × 2).
+/// Uses CGDisplayMode to query actual hardware pixel dimensions per-display.
+/// This is critical for pixel-perfect recording on Apple Silicon Macs.
+pub fn display_physical_size(display: &SCDisplay) -> (usize, usize, f64) {
+    let display_id: u32 = unsafe { msg_send![display, displayID] };
+
+    // CoreGraphics functions for querying physical pixel resolution.
+    extern "C" {
+        fn CGDisplayCopyDisplayMode(display: u32) -> *const std::ffi::c_void;
+        fn CGDisplayModeGetPixelWidth(mode: *const std::ffi::c_void) -> usize;
+        fn CGDisplayModeGetPixelHeight(mode: *const std::ffi::c_void) -> usize;
+        fn CGDisplayModeRelease(mode: *const std::ffi::c_void);
+    }
+
+    unsafe {
+        let mode = CGDisplayCopyDisplayMode(display_id);
+        if mode.is_null() {
+            let (w, h) = display_size(display);
+            println!("[zureshot] Warning: CGDisplayCopyDisplayMode null, using logical {}x{}", w, h);
+            return (w, h, 1.0);
+        }
+        let phys_w = CGDisplayModeGetPixelWidth(mode);
+        let phys_h = CGDisplayModeGetPixelHeight(mode);
+        CGDisplayModeRelease(mode);
+
+        let (logical_w, _) = display_size(display);
+        let scale = if logical_w > 0 {
+            phys_w as f64 / logical_w as f64
+        } else {
+            1.0
+        };
+
+        (phys_w, phys_h, scale)
     }
 }
 
@@ -434,6 +473,23 @@ pub fn create_and_start(
         // Lower queue = less IOSurface memory held = smaller RSS.
         c.setQueueDepth(3);
 
+        // ── M-series optimization: force maximum physical pixel resolution ──
+        // SCCaptureResolutionBest forces capture at native Retina pixels (e.g. 3200×2132)
+        // instead of Automatic which may fall back to logical resolution on some configs.
+        // This is THE key setting for pixel-perfect sharpness on Apple Silicon.
+        c.setCaptureResolution(SCCaptureResolutionType::Best);
+
+        // ── Color space: sRGB ──
+        // Explicitly set sRGB to prevent implicit color space conversions between
+        // SCK capture → VideoToolbox encoder. Without this, the system may apply
+        // Display P3 → BT.709 conversion that softens pixel edges.
+        c.setColorSpaceName(kCGColorSpaceSRGB);
+
+        // ── Opaque rendering ──
+        // Tell SCK the content is fully opaque (no alpha channel needed).
+        // This avoids alpha premultiplication overhead and produces cleaner pixels.
+        c.setShouldBeOpaque(true);
+
         // ── Region crop (if requested) ──
         if let Some(rect) = source_rect {
             c.setSourceRect(rect);
@@ -441,8 +497,12 @@ pub fn create_and_start(
                 CGPoint::new(0.0, 0.0),
                 CGSize::new(width as f64, height as f64),
             ));
+            // Disable scaling-to-fit for region capture.
+            // When sourceRect physical pixels == destinationRect, we want 1:1 pixel
+            // mapping with no bilinear/bicubic interpolation that causes blur.
+            c.setScalesToFit(false);
             println!(
-                "[zureshot] Region capture: sourceRect=({},{} {}x{}), output={}x{}",
+                "[zureshot] Region capture: sourceRect=({},{} {}x{}), output={}x{}, scalesToFit=false",
                 rect.origin.x, rect.origin.y,
                 rect.size.width, rect.size.height,
                 width, height
@@ -466,7 +526,7 @@ pub fn create_and_start(
     };
 
     println!(
-        "[zureshot] Capture config: {}x{} @ {}fps, quality={:?}, queueDepth=3",
+        "[zureshot] Capture config: {}x{} @ {}fps, quality={:?}, resolution=Best, colorSpace=sRGB, opaque=true",
         width, height, fps, quality
     );
 

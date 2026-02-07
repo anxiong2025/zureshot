@@ -25,7 +25,11 @@ use objc2_av_foundation::{
     AVVideoMaxKeyFrameIntervalDurationKey,
     AVVideoExpectedSourceFrameRateKey,
     AVVideoCodecTypeHEVC, AVVideoAllowFrameReorderingKey,
-    AVVideoQualityKey,
+    AVVideoQualityKey, AVVideoColorPropertiesKey,
+    AVVideoColorPrimariesKey, AVVideoColorPrimaries_ITU_R_709_2,
+    AVVideoTransferFunctionKey, AVVideoTransferFunction_ITU_R_709_2,
+    AVVideoYCbCrMatrixKey, AVVideoYCbCrMatrix_ITU_R_709_2,
+    AVVideoProfileLevelKey,
 };
 use objc2_foundation::{NSError, NSString, NSNumber};
 
@@ -49,7 +53,7 @@ fn catch_objc<R>(context: &str, f: impl FnOnce() -> R) -> Result<R, String> {
 
 /// Create an AVAssetWriter + AVAssetWriterInput configured for HEVC recording.
 ///
-/// The writer is started immediately (startWriting called).
+/// The writer is NOT started — call `start_writing()` after adding all inputs.
 /// Call `finalize()` when recording is complete.
 pub fn create_writer(
     output_path: &str,
@@ -120,17 +124,13 @@ pub fn create_writer(
         input.setExpectsMediaDataInRealTime(true);
     }
 
-    // Wire input → writer and start
-    catch_objc("addInput + startWriting", || unsafe {
+    // Add video input (caller adds audio inputs, then calls start_writing)
+    catch_objc("addInput(video)", || unsafe {
         writer.addInput(&input);
-        assert!(
-            writer.startWriting(),
-            "AVAssetWriter failed to start writing"
-        );
     })?;
 
     println!(
-        "[zureshot] Writer ready: H.264 {}x{} → {}",
+        "[zureshot] Writer ready: HEVC {}x{} BT.709 → {}",
         width, height, output_str
     );
     Ok((writer, input))
@@ -193,6 +193,19 @@ pub fn create_audio_input(label: &str) -> Result<Retained<AVAssetWriterInput>, S
     Ok(input)
 }
 
+/// Start the AVAssetWriter after all inputs have been added.
+///
+/// MUST be called after `create_writer()` and all `addInput()` calls.
+/// AVAssetWriter does not allow adding inputs after writing has started.
+pub fn start_writing(writer: &AVAssetWriter) -> Result<(), String> {
+    catch_objc("startWriting", || unsafe {
+        assert!(
+            writer.startWriting(),
+            "AVAssetWriter failed to start writing"
+        );
+    })
+}
+
 /// Finalize the recording: mark input as finished, complete the MP4 file.
 ///
 /// This writes the moov atom and closes the file. The MP4 is not playable
@@ -226,7 +239,7 @@ pub fn finalize(
     }
 
     println!("[zureshot] Finalize: marking inputs as finished...");
-    unsafe {
+    let mark_result = catch_objc("markAsFinished", || unsafe {
         input.markAsFinished();
         if let Some(ai) = audio_input {
             ai.markAsFinished();
@@ -236,6 +249,9 @@ pub fn finalize(
             mi.markAsFinished();
             println!("[zureshot] Finalize: mic input marked finished");
         }
+    });
+    if let Err(e) = mark_result {
+        println!("[zureshot] Warning: {}", e);
     }
 
     println!("[zureshot] Finalize: calling finishWritingWithCompletionHandler...");
@@ -346,9 +362,12 @@ fn create_video_settings(width: usize, height: usize, quality: RecordingQuality)
         // AVVideoQualityKey: 0.0–1.0, hint to encoder for quality-targeted VBR.
         // Combined with bitrate, the encoder uses bitrate as ceiling and quality
         // as the target — sharp screen text with minimal file size bloat.
+        // M-series optimized: higher quality targeting preserves text edge sharpness.
+        // Screen content (text, UI) is very sensitive to quantization — even small
+        // quality drops cause visible softening of font edges.
         let quality_val: f64 = match quality {
-            RecordingQuality::Standard => 0.85,
-            RecordingQuality::High => 0.92,
+            RecordingQuality::Standard => 0.92,
+            RecordingQuality::High => 0.97,
         };
         let quality_key = AVVideoQualityKey.expect("AVVideoQualityKey not available");
         let quality_num = NSNumber::new_f64(quality_val);
@@ -372,8 +391,38 @@ fn create_video_settings(width: usize, height: usize, quality: RecordingQuality)
         let no = NSNumber::new_bool(false);
         dict_set_nsstring(&comp, reorder_key, &no);
 
+        // ── HEVC Profile: Main Auto Level ──
+        // Explicitly request Main profile to ensure the hardware encoder uses
+        // the optimal encoding tools for screen content on Apple Silicon.
+        // "HEVC_Main_AutoLevel" is the VideoToolbox profile string for HEVC Main.
+        let profile_key = AVVideoProfileLevelKey.expect("AVVideoProfileLevelKey not available");
+        let profile_val = NSString::from_str("HEVC_Main_AutoLevel");
+        dict_set_nsstring(&comp, profile_key, &profile_val);
+
         let comp_key = AVVideoCompressionPropertiesKey.expect("AVVideoCompressionPropertiesKey not available");
         dict_set_nsstring(&dict, comp_key, &comp);
+
+        // ── BT.709 color properties ──
+        // Explicitly tag the video stream with BT.709 color space metadata.
+        // This prevents implicit color space conversions between capture (sRGB)
+        // and encoding that can cause softening of text edges.
+        // sRGB ≈ BT.709 transfer + BT.709 primaries — a lossless metadata match.
+        let color_props: Retained<AnyObject> = msg_send![class!(NSMutableDictionary), new];
+
+        let primaries_key = AVVideoColorPrimariesKey.expect("AVVideoColorPrimariesKey not available");
+        let primaries_val = AVVideoColorPrimaries_ITU_R_709_2.expect("AVVideoColorPrimaries_ITU_R_709_2 not available");
+        dict_set_nsstring(&color_props, primaries_key, primaries_val);
+
+        let transfer_key = AVVideoTransferFunctionKey.expect("AVVideoTransferFunctionKey not available");
+        let transfer_val = AVVideoTransferFunction_ITU_R_709_2.expect("AVVideoTransferFunction_ITU_R_709_2 not available");
+        dict_set_nsstring(&color_props, transfer_key, transfer_val);
+
+        let matrix_key = AVVideoYCbCrMatrixKey.expect("AVVideoYCbCrMatrixKey not available");
+        let matrix_val = AVVideoYCbCrMatrix_ITU_R_709_2.expect("AVVideoYCbCrMatrix_ITU_R_709_2 not available");
+        dict_set_nsstring(&color_props, matrix_key, matrix_val);
+
+        let color_props_key = AVVideoColorPropertiesKey.expect("AVVideoColorPropertiesKey not available");
+        dict_set_nsstring(&dict, color_props_key, &color_props);
 
         dict
     }
@@ -395,29 +444,33 @@ unsafe fn dict_set_nsstring(dict: &AnyObject, key: &NSString, value: &AnyObject)
 ///   Zureshot High 1440p:        14 Mbps (HEVC) — premium quality, still smaller
 fn compute_bitrate(width: usize, height: usize, quality: RecordingQuality) -> i64 {
     let pixels = width * height;
+    // M-series optimized bitrates for screen content.
+    // Screen recordings (text, UI, code editors) need higher bitrate than
+    // camera video because sharp text edges are very sensitive to quantization.
+    // HEVC hardware encoder on Apple Silicon handles these rates effortlessly.
     match quality {
         RecordingQuality::Standard => {
-            // Standard: sharp Retina, moderate file size
+            // Standard: pixel-perfect text at 30fps
             if pixels >= 3840 * 2160 {
-                18_000_000  // 4K+ Standard: 18 Mbps HEVC
+                24_000_000  // 4K+ Standard: 24 Mbps HEVC
             } else if pixels >= 2560 * 1440 {
-                10_000_000  // 1440p+ Standard: 10 Mbps HEVC
+                16_000_000  // 1440p+ Standard: 16 Mbps HEVC
             } else if pixels >= 1920 * 1080 {
-                8_000_000   // 1080p+ Standard: 8 Mbps HEVC
+                12_000_000  // 1080p+ Standard: 12 Mbps HEVC
             } else {
-                5_000_000   // Small region: 5 Mbps HEVC
+                8_000_000   // Small region: 8 Mbps HEVC
             }
         }
         RecordingQuality::High => {
-            // High: maximum quality, 60fps smooth
+            // High: lossless-quality text at 60fps
             if pixels >= 3840 * 2160 {
-                28_000_000  // 4K+ High: 28 Mbps HEVC
+                36_000_000  // 4K+ High: 36 Mbps HEVC
             } else if pixels >= 2560 * 1440 {
-                18_000_000  // 1440p+ High: 18 Mbps HEVC
+                24_000_000  // 1440p+ High: 24 Mbps HEVC
             } else if pixels >= 1920 * 1080 {
-                14_000_000  // 1080p+ High: 14 Mbps HEVC
+                18_000_000  // 1080p+ High: 18 Mbps HEVC
             } else {
-                8_000_000   // Small region: 8 Mbps HEVC
+                12_000_000  // Small region: 12 Mbps HEVC
             }
         }
     }
