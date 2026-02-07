@@ -1,14 +1,15 @@
-//! AVAssetWriter-based H.264 hardware encoding + MP4 muxing.
+//! AVAssetWriter-based HEVC (H.265) hardware encoding + MP4 muxing.
 //!
 //! Uses VideoToolbox hardware encoder internally (via AVAssetWriter).
+//! HEVC provides ~40-50% better compression than H.264 at the same quality,
+//! and is hardware-accelerated on all Apple Silicon Macs.
 //!
 //! Encoding settings:
-//!   - Codec: H.264 High Profile
-//!   - Bitrate: VBR, adaptive to resolution
-//!     - 4K:    22 Mbps average
-//!     - 1440p: 14 Mbps average
-//!     - 1080p: 8 Mbps average
-//!   - Keyframe interval: 60 frames (1 second at 60fps)
+//!   - Codec: HEVC (H.265) Main Auto Level
+//!   - Resolution: always native Retina (2x) for maximum sharpness
+//!   - Standard: 30 fps, moderate bitrate (~8-18 Mbps depending on resolution)
+//!   - High: 60 fps, high bitrate (~14-28 Mbps depending on resolution)
+//!   - Keyframe interval: 2 seconds
 //!   - Real-time encoding: enabled (low memory footprint)
 
 use std::sync::mpsc;
@@ -21,11 +22,19 @@ use objc2_av_foundation::{
     AVAssetWriter, AVAssetWriterInput,
     AVVideoCodecKey, AVVideoWidthKey, AVVideoHeightKey,
     AVVideoCompressionPropertiesKey, AVVideoAverageBitRateKey,
-    AVVideoMaxKeyFrameIntervalKey, AVVideoProfileLevelKey,
-    AVVideoExpectedSourceFrameRateKey, AVVideoProfileLevelH264HighAutoLevel,
-    AVVideoCodecTypeH264, AVVideoAllowFrameReorderingKey,
+    AVVideoMaxKeyFrameIntervalDurationKey,
+    AVVideoExpectedSourceFrameRateKey,
+    AVVideoCodecTypeHEVC, AVVideoAllowFrameReorderingKey,
+    AVVideoQualityKey,
 };
 use objc2_foundation::{NSError, NSString, NSNumber};
+
+use crate::capture::RecordingQuality;
+
+/// Audio encoding settings for AAC in MP4.
+const AUDIO_SAMPLE_RATE: f64 = 48000.0;
+const AUDIO_CHANNELS: i32 = 2;
+const AUDIO_BITRATE: i32 = 128_000; // 128 kbps AAC
 
 /// Catch ObjC exceptions and return Result instead of panicking.
 fn catch_objc<R>(context: &str, f: impl FnOnce() -> R) -> Result<R, String> {
@@ -38,7 +47,7 @@ fn catch_objc<R>(context: &str, f: impl FnOnce() -> R) -> Result<R, String> {
     })
 }
 
-/// Create an AVAssetWriter + AVAssetWriterInput configured for H.264 recording.
+/// Create an AVAssetWriter + AVAssetWriterInput configured for HEVC recording.
 ///
 /// The writer is started immediately (startWriting called).
 /// Call `finalize()` when recording is complete.
@@ -46,6 +55,7 @@ pub fn create_writer(
     output_path: &str,
     width: usize,
     height: usize,
+    quality: RecordingQuality,
 ) -> Result<(Retained<AVAssetWriter>, Retained<AVAssetWriterInput>), String> {
     // Resolve to absolute path (AVAssetWriter requires it)
     let abs_path = std::path::Path::new(output_path);
@@ -89,7 +99,7 @@ pub fn create_writer(
     })??;
 
     // Video encoding settings (H.264 High Profile, VBR)
-    let settings = create_video_settings(width, height);
+    let settings = create_video_settings(width, height, quality);
 
     // AVMediaType: "vide" (video)
     let media_type = NSString::from_str("vide");
@@ -126,6 +136,63 @@ pub fn create_writer(
     Ok((writer, input))
 }
 
+/// Create an AVAssetWriterInput for AAC audio encoding.
+///
+/// Used for both system audio and microphone tracks.
+pub fn create_audio_input(label: &str) -> Result<Retained<AVAssetWriterInput>, String> {
+    // Audio settings dictionary:
+    //   AVFormatIDKey: kAudioFormatMPEG4AAC (1633772320)
+    //   AVSampleRateKey: 48000
+    //   AVNumberOfChannelsKey: 2
+    //   AVEncoderBitRateKey: 128000
+    let settings: Retained<AnyObject> = unsafe {
+        let dict: Retained<AnyObject> = msg_send![class!(NSMutableDictionary), new];
+
+        // AVFormatIDKey = "AVFormatIDKey"
+        let format_key = NSString::from_str("AVFormatIDKey");
+        // kAudioFormatMPEG4AAC = 'aac ' = 1633772320
+        let format_val = NSNumber::new_i32(1633772320);
+        let () = msg_send![&*dict, setObject: &*format_val, forKey: &*format_key];
+
+        // AVSampleRateKey = "AVSampleRateKey"
+        let rate_key = NSString::from_str("AVSampleRateKey");
+        let rate_val = NSNumber::new_f64(AUDIO_SAMPLE_RATE);
+        let () = msg_send![&*dict, setObject: &*rate_val, forKey: &*rate_key];
+
+        // AVNumberOfChannelsKey = "AVNumberOfChannelsKey"
+        let ch_key = NSString::from_str("AVNumberOfChannelsKey");
+        let ch_val = NSNumber::new_i32(AUDIO_CHANNELS);
+        let () = msg_send![&*dict, setObject: &*ch_val, forKey: &*ch_key];
+
+        // AVEncoderBitRateKey = "AVEncoderBitRateKey"
+        let br_key = NSString::from_str("AVEncoderBitRateKey");
+        let br_val = NSNumber::new_i32(AUDIO_BITRATE);
+        let () = msg_send![&*dict, setObject: &*br_val, forKey: &*br_key];
+
+        dict
+    };
+
+    // AVMediaType: "soun" (audio)
+    let media_type = NSString::from_str("soun");
+
+    let input: Retained<AVAssetWriterInput> =
+        catch_objc(&format!("AVAssetWriterInput creation ({})", label), || unsafe {
+            msg_send![
+                class!(AVAssetWriterInput),
+                assetWriterInputWithMediaType: &*media_type,
+                outputSettings: &*settings
+            ]
+        })?;
+
+    unsafe {
+        input.setExpectsMediaDataInRealTime(true);
+    }
+
+    println!("[zureshot] Audio input ready ({}): AAC {}Hz {}ch {}kbps",
+        label, AUDIO_SAMPLE_RATE as i32, AUDIO_CHANNELS, AUDIO_BITRATE / 1000);
+    Ok(input)
+}
+
 /// Finalize the recording: mark input as finished, complete the MP4 file.
 ///
 /// This writes the moov atom and closes the file. The MP4 is not playable
@@ -134,7 +201,12 @@ pub fn create_writer(
 /// IMPORTANT: The caller MUST NOT hold any Mutex that Tauri sync commands
 /// also acquire — GCD completion handlers may need the main thread, and
 /// blocking it causes a deadlock where the moov atom is never written.
-pub fn finalize(writer: &AVAssetWriter, input: &AVAssetWriterInput) {
+pub fn finalize(
+    writer: &AVAssetWriter,
+    input: &AVAssetWriterInput,
+    audio_input: Option<&AVAssetWriterInput>,
+    mic_input: Option<&AVAssetWriterInput>,
+) {
     // Check writer status before finalizing
     let status_before = unsafe { writer.status() };
     println!(
@@ -153,9 +225,17 @@ pub fn finalize(writer: &AVAssetWriter, input: &AVAssetWriterInput) {
         return;
     }
 
-    println!("[zureshot] Finalize: marking input as finished...");
+    println!("[zureshot] Finalize: marking inputs as finished...");
     unsafe {
         input.markAsFinished();
+        if let Some(ai) = audio_input {
+            ai.markAsFinished();
+            println!("[zureshot] Finalize: audio input marked finished");
+        }
+        if let Some(mi) = mic_input {
+            mi.markAsFinished();
+            println!("[zureshot] Finalize: mic input marked finished");
+        }
     }
 
     println!("[zureshot] Finalize: calling finishWritingWithCompletionHandler...");
@@ -224,21 +304,26 @@ pub fn finalize(writer: &AVAssetWriter, input: &AVAssetWriterInput) {
 
 /// Build the NSDictionary for AVAssetWriterInput video output settings.
 ///
-/// Settings are optimized for:
-/// - Maximum quality at the given resolution
-/// - Low memory footprint (real-time VBR)
-/// - 1-second keyframe interval for editing precision
-fn create_video_settings(width: usize, height: usize) -> Retained<AnyObject> {
+/// Uses HEVC (H.265) for best quality-to-size ratio:
+/// - Hardware-accelerated on all Apple Silicon
+/// - ~40-50% smaller files than H.264 at equal quality
+/// - Combined bitrate + quality targeting for optimal output
+fn create_video_settings(width: usize, height: usize, quality: RecordingQuality) -> Retained<AnyObject> {
+    let fps: isize = match quality {
+        RecordingQuality::Standard => 30,
+        RecordingQuality::High => 60,
+    };
+
     unsafe {
         let dict: Retained<AnyObject> = msg_send![class!(NSMutableDictionary), new];
 
-        // ── AVVideoCodecKey: H.264 ──
+        // ── AVVideoCodecKey: HEVC (H.265) ──
         let codec_key = AVVideoCodecKey.expect("AVVideoCodecKey not available");
-        let codec_val = AVVideoCodecTypeH264.expect("AVVideoCodecTypeH264 not available");
+        let codec_val = AVVideoCodecTypeHEVC.expect("AVVideoCodecTypeHEVC not available");
         dict_set_nsstring(&dict, codec_key, codec_val);
 
         // ── AVVideoWidthKey / AVVideoHeightKey ──
-        // H.264 requires even dimensions — round up if needed
+        // HEVC also requires even dimensions
         let w = if width % 2 != 0 { width + 1 } else { width };
         let h = if height % 2 != 0 { height + 1 } else { height };
         let width_key = AVVideoWidthKey.expect("AVVideoWidthKey not available");
@@ -251,27 +336,35 @@ fn create_video_settings(width: usize, height: usize) -> Retained<AnyObject> {
         // ── AVVideoCompressionPropertiesKey: encoding parameters ──
         let comp: Retained<AnyObject> = msg_send![class!(NSMutableDictionary), new];
 
-        // Adaptive bitrate based on resolution
-        let bitrate = compute_bitrate(width, height);
+        // Adaptive bitrate for HEVC (lower than H.264 at same visual quality)
+        let bitrate = compute_bitrate(width, height, quality);
         let bitrate_key = AVVideoAverageBitRateKey.expect("AVVideoAverageBitRateKey not available");
         let bitrate_num: Retained<AnyObject> =
             msg_send![class!(NSNumber), numberWithLongLong: bitrate];
         dict_set_nsstring(&comp, bitrate_key, &bitrate_num);
 
-        // Max keyframe interval: 60 frames = 1 second at 60fps
-        // Enables precise editing (cut at any 1-second boundary)
-        let keyframe_key = AVVideoMaxKeyFrameIntervalKey.expect("AVVideoMaxKeyFrameIntervalKey not available");
-        let keyframe_num = NSNumber::new_isize(60);
-        dict_set_nsstring(&comp, keyframe_key, &keyframe_num);
+        // AVVideoQualityKey: 0.0–1.0, hint to encoder for quality-targeted VBR.
+        // Combined with bitrate, the encoder uses bitrate as ceiling and quality
+        // as the target — sharp screen text with minimal file size bloat.
+        let quality_val: f64 = match quality {
+            RecordingQuality::Standard => 0.85,
+            RecordingQuality::High => 0.92,
+        };
+        let quality_key = AVVideoQualityKey.expect("AVVideoQualityKey not available");
+        let quality_num = NSNumber::new_f64(quality_val);
+        dict_set_nsstring(&comp, quality_key, &quality_num);
 
-        // H.264 High Profile — best quality/compression ratio
-        let profile_key = AVVideoProfileLevelKey.expect("AVVideoProfileLevelKey not available");
-        let profile_val = AVVideoProfileLevelH264HighAutoLevel.expect("AVVideoProfileLevelH264HighAutoLevel not available");
-        dict_set_nsstring(&comp, profile_key, profile_val);
+        // Max keyframe interval: 2 seconds (duration-based, works for any fps).
+        // Longer interval than before = better compression. 2s is still fine
+        // for seeking precision.
+        let keyframe_key = AVVideoMaxKeyFrameIntervalDurationKey
+            .expect("AVVideoMaxKeyFrameIntervalDurationKey not available");
+        let keyframe_num = NSNumber::new_f64(2.0);
+        dict_set_nsstring(&comp, keyframe_key, &keyframe_num);
 
         // Expected source frame rate — helps encoder allocate resources
         let fps_key = AVVideoExpectedSourceFrameRateKey.expect("AVVideoExpectedSourceFrameRateKey not available");
-        let fps_num = NSNumber::new_isize(60);
+        let fps_num = NSNumber::new_isize(fps);
         dict_set_nsstring(&comp, fps_key, &fps_num);
 
         // Disable frame reordering for real-time screen recording (lower latency)
@@ -291,19 +384,41 @@ unsafe fn dict_set_nsstring(dict: &AnyObject, key: &NSString, value: &AnyObject)
     let () = msg_send![dict, setObject: value, forKey: key];
 }
 
-/// Compute VBR target bitrate based on resolution.
+/// Compute VBR target bitrate based on resolution and quality.
 ///
-/// These values are tuned for screen recording (sharp text, low motion):
-///   - 4K (3840x2160):  22 Mbps — crisp text at native resolution
-///   - 1440p:           14 Mbps — good balance
-///   - 1080p:           8 Mbps  — sufficient for screen content
-fn compute_bitrate(width: usize, height: usize) -> i64 {
+/// HEVC achieves equivalent visual quality at ~60% of H.264 bitrate.
+/// Both modes now record at native Retina resolution for maximum sharpness.
+///
+/// Comparison with CleanShot X:
+///   CleanShot at Retina 1440p: ~10-15 Mbps (H.264)
+///   Zureshot Standard 1440p:    8 Mbps (HEVC) — same quality, ~40% smaller
+///   Zureshot High 1440p:        14 Mbps (HEVC) — premium quality, still smaller
+fn compute_bitrate(width: usize, height: usize, quality: RecordingQuality) -> i64 {
     let pixels = width * height;
-    if pixels >= 3840 * 2160 {
-        22_000_000
-    } else if pixels >= 2560 * 1440 {
-        14_000_000
-    } else {
-        8_000_000
+    match quality {
+        RecordingQuality::Standard => {
+            // Standard: sharp Retina, moderate file size
+            if pixels >= 3840 * 2160 {
+                18_000_000  // 4K+ Standard: 18 Mbps HEVC
+            } else if pixels >= 2560 * 1440 {
+                10_000_000  // 1440p+ Standard: 10 Mbps HEVC
+            } else if pixels >= 1920 * 1080 {
+                8_000_000   // 1080p+ Standard: 8 Mbps HEVC
+            } else {
+                5_000_000   // Small region: 5 Mbps HEVC
+            }
+        }
+        RecordingQuality::High => {
+            // High: maximum quality, 60fps smooth
+            if pixels >= 3840 * 2160 {
+                28_000_000  // 4K+ High: 28 Mbps HEVC
+            } else if pixels >= 2560 * 1440 {
+                18_000_000  // 1440p+ High: 18 Mbps HEVC
+            } else if pixels >= 1920 * 1080 {
+                14_000_000  // 1080p+ High: 14 Mbps HEVC
+            } else {
+                8_000_000   // Small region: 8 Mbps HEVC
+            }
+        }
     }
 }

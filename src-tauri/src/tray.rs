@@ -9,6 +9,7 @@ use tauri::{
 
 use crate::commands;
 use crate::commands::RecordingState;
+use crate::capture::RecordingQuality;
 use std::sync::Mutex;
 
 const TRAY_ID: &str = "zureshot-tray";
@@ -55,9 +56,23 @@ fn build_menu(app: &AppHandle, is_recording: bool) -> Result<Menu<tauri::Wry>, B
     let start_recording = MenuItem::with_id(
         app,
         "start",
-        "📹 Start Recording",
+        "📹 Record Screen (Standard)",
         !is_recording,
         Some("CmdOrCtrl+Shift+R"),
+    )?;
+    let start_recording_hd = MenuItem::with_id(
+        app,
+        "start_hd",
+        "📹 Record Screen (High Quality)",
+        !is_recording,
+        None::<&str>,
+    )?;
+    let record_region = MenuItem::with_id(
+        app,
+        "record_region",
+        "🔲 Record Region",
+        !is_recording,
+        Some("CmdOrCtrl+Shift+A"),
     )?;
     let stop_recording = MenuItem::with_id(
         app,
@@ -80,6 +95,8 @@ fn build_menu(app: &AppHandle, is_recording: bool) -> Result<Menu<tauri::Wry>, B
         app,
         &[
             &start_recording,
+            &start_recording_hd,
+            &record_region,
             &stop_recording,
             &separator,
             &open_recordings,
@@ -132,18 +149,46 @@ fn update_menu_state(app: &AppHandle, is_recording: bool) {
 fn handle_menu_event(app: &AppHandle, id: &str) {
     match id {
         "start" => {
-            // Spawn on background thread — capture::create_and_start blocks
-            // waiting for ObjC completion handlers that may need the main run loop
+            // Standard quality: logical resolution, 30fps
             let app = app.clone();
             std::thread::spawn(move || {
-                match commands::do_start_recording(&app, None) {
+                match commands::do_start_recording(&app, None, None, RecordingQuality::Standard, false, false) {
                     Ok(path) => {
-                        println!("[zureshot] Started via menu: {}", path);
+                        println!("[zureshot] Started Standard recording via menu: {}", path);
                         update_menu_state(&app, true);
+                        // Open the floating recording control bar
+                        let _ = commands::do_open_recording_bar(&app, None);
+                        // Refresh stream filter to exclude the new bar window
+                        std::thread::sleep(std::time::Duration::from_millis(150));
+                        let _ = commands::refresh_stream_exclusion(&app);
                     }
                     Err(e) => eprintln!("[zureshot] Start error: {}", e),
                 }
             });
+        }
+        "start_hd" => {
+            // High quality: native Retina resolution, 60fps
+            let app = app.clone();
+            std::thread::spawn(move || {
+                match commands::do_start_recording(&app, None, None, RecordingQuality::High, false, false) {
+                    Ok(path) => {
+                        println!("[zureshot] Started High-Quality recording via menu: {}", path);
+                        update_menu_state(&app, true);
+                        // Open the floating recording control bar
+                        let _ = commands::do_open_recording_bar(&app, None);
+                        // Refresh stream filter to exclude the new bar window
+                        std::thread::sleep(std::time::Duration::from_millis(150));
+                        let _ = commands::refresh_stream_exclusion(&app);
+                    }
+                    Err(e) => eprintln!("[zureshot] Start error: {}", e),
+                }
+            });
+        }
+        "record_region" => {
+            match commands::do_start_region_selection(app) {
+                Ok(()) => println!("[zureshot] Region selector opened via menu"),
+                Err(e) => eprintln!("[zureshot] Region selection error: {}", e),
+            }
         }
         "stop" => {
             // CRITICAL: Must run on background thread!

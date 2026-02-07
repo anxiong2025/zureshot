@@ -47,6 +47,11 @@ pub fn main() {
             commands::get_recording_status,
             commands::reveal_in_finder,
             commands::get_recordings_dir,
+            commands::start_region_selection,
+            commands::confirm_region_selection,
+            commands::cancel_region_selection,
+            commands::pause_recording,
+            commands::resume_recording,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

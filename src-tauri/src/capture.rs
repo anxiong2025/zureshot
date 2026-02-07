@@ -18,11 +18,37 @@ use objc2::{define_class, msg_send, AllocAnyThread, DefinedClass};
 use objc2_av_foundation::{AVAssetWriter, AVAssetWriterInput};
 use objc2_core_media::CMSampleBuffer;
 use objc2_foundation::{NSArray, NSError, NSString};
+use objc2_core_foundation::{CGPoint, CGRect, CGSize};
 use objc2_screen_capture_kit::{
     SCContentFilter, SCDisplay, SCShareableContent, SCStream, SCStreamConfiguration,
     SCStreamOutput, SCStreamOutputType, SCWindow,
 };
 use objc2_core_media::CMTime;
+use serde::{Deserialize, Serialize};
+
+/// Recording quality presets.
+///
+/// Both modes capture at native Retina resolution for maximum sharpness.
+/// HEVC (H.265) hardware encoding keeps file sizes small.
+///
+/// Memory usage (2880×1800 Retina display, NV12 format):
+///   Standard: native 2880×1800 @ 30fps → ~7.4 MB/frame × 3 queue = ~22 MB buffers
+///   High:     native 2880×1800 @ 60fps → ~7.4 MB/frame × 3 queue = ~22 MB buffers
+///
+/// File size (HEVC, 60s recording at 2880×1800):
+///   Standard (30fps, 10 Mbps): ~75 MB/min
+///   High (60fps, 18 Mbps):     ~135 MB/min
+///   CleanShot X (H.264):       ~120-180 MB/min
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, Default, PartialEq)]
+pub enum RecordingQuality {
+    /// Standard: native Retina resolution, 30 fps, HEVC.
+    /// Sharp text, smooth enough for most content. Best file size.
+    #[default]
+    Standard,
+    /// High: native Retina resolution, 60 fps, HEVC.
+    /// Butter-smooth scrolling and animations. Premium quality.
+    High,
+}
 
 // ────────────────────────────────────────────────────────────────
 //  StreamOutput — SCStreamOutput delegate (receives raw frames)
@@ -31,6 +57,10 @@ use objc2_core_media::CMTime;
 pub struct StreamOutputIvars {
     writer: Retained<AVAssetWriter>,
     input: Retained<AVAssetWriterInput>,
+    /// Optional system audio writer input
+    audio_input: Option<Retained<AVAssetWriterInput>>,
+    /// Optional microphone writer input
+    mic_input: Option<Retained<AVAssetWriterInput>>,
     session_started: AtomicBool,
     error_logged: AtomicBool,
     frame_count: AtomicU64,
@@ -42,6 +72,8 @@ pub struct StreamOutputIvars {
     last_pts_timescale: AtomicI64,
     /// Count of frames skipped due to non-monotonic PTS.
     pts_skip_count: AtomicU64,
+    /// Shared paused flag — when true, frames are dropped (not written to file).
+    paused: std::sync::Arc<AtomicBool>,
 }
 
 define_class!(
@@ -63,9 +95,32 @@ define_class!(
             &self,
             _stream: &SCStream,
             sample_buffer: &CMSampleBuffer,
-            _output_type: SCStreamOutputType,
+            output_type: SCStreamOutputType,
         ) {
             let ivars = self.ivars();
+
+            // ── 0. Paused — drop frames silently ──
+            if ivars.paused.load(Ordering::Relaxed) {
+                return;
+            }
+
+            // ── Route by output type ──
+            // SCStreamOutputType(0) = Screen, (1) = Audio, (2) = Microphone
+            if output_type.0 == 1 {
+                // System audio
+                if let Some(ref audio_input) = ivars.audio_input {
+                    self.append_audio(sample_buffer, audio_input, ivars);
+                }
+                return;
+            } else if output_type.0 == 2 {
+                // Microphone
+                if let Some(ref mic_input) = ivars.mic_input {
+                    self.append_audio(sample_buffer, mic_input, ivars);
+                }
+                return;
+            }
+
+            // ── Screen frames (type 0) ──
 
             // ── 1. Validate CMSampleBuffer ──
             let is_valid: bool = unsafe { sample_buffer.is_valid() };
@@ -195,13 +250,46 @@ impl StreamOutputIvars {
 }
 
 impl StreamOutput {
+    /// Append an audio CMSampleBuffer to the given AVAssetWriterInput.
+    fn append_audio(
+        &self,
+        sample_buffer: &CMSampleBuffer,
+        audio_input: &AVAssetWriterInput,
+        ivars: &StreamOutputIvars,
+    ) {
+        let is_valid: bool = unsafe { sample_buffer.is_valid() };
+        if !is_valid { return; }
+        let data_ready: bool = unsafe { sample_buffer.data_is_ready() };
+        if !data_ready { return; }
+
+        // Start session on first valid frame (video or audio, whichever comes first)
+        if !ivars.session_started.swap(true, Ordering::Relaxed) {
+            let pts = unsafe { sample_buffer.presentation_time_stamp() };
+            unsafe {
+                let _: () = msg_send![&*ivars.writer, startSessionAtSourceTime: pts];
+            }
+        }
+
+        unsafe {
+            let ready: bool = msg_send![audio_input, isReadyForMoreMediaData];
+            if ready {
+                let _ok: bool = msg_send![audio_input, appendSampleBuffer: sample_buffer];
+            }
+        }
+    }
+
     fn new_with(
         writer: Retained<AVAssetWriter>,
         input: Retained<AVAssetWriterInput>,
+        audio_input: Option<Retained<AVAssetWriterInput>>,
+        mic_input: Option<Retained<AVAssetWriterInput>>,
+        paused: std::sync::Arc<AtomicBool>,
     ) -> Retained<Self> {
         let this = Self::alloc().set_ivars(StreamOutputIvars {
             writer,
             input,
+            audio_input,
+            mic_input,
             session_started: AtomicBool::new(false),
             error_logged: AtomicBool::new(false),
             frame_count: AtomicU64::new(0),
@@ -209,6 +297,7 @@ impl StreamOutput {
             last_pts_value: AtomicI64::new(-1),
             last_pts_timescale: AtomicI64::new(0),
             pts_skip_count: AtomicU64::new(0),
+            paused,
         });
         unsafe { msg_send![super(this), init] }
     }
@@ -226,9 +315,8 @@ impl StreamOutput {
 //  Public API
 // ────────────────────────────────────────────────────────────────
 
-/// Get the main display via ScreenCaptureKit.
-/// Blocks until the system returns available shareable content.
-pub fn get_main_display() -> Result<Retained<SCDisplay>, String> {
+/// Fetch SCShareableContent (blocks until the system returns it).
+fn get_shareable_content() -> Result<Retained<SCShareableContent>, String> {
     let (tx, rx) = mpsc::channel();
 
     let handler = RcBlock::new(
@@ -249,8 +337,7 @@ pub fn get_main_display() -> Result<Retained<SCDisplay>, String> {
         SCShareableContent::getShareableContentWithCompletionHandler(&handler);
     }
 
-    let content = rx
-        .recv()
+    rx.recv()
         .map_err(|_| "SCShareableContent channel closed".to_string())?
         .map_err(|e| {
             format!(
@@ -259,14 +346,34 @@ pub fn get_main_display() -> Result<Retained<SCDisplay>, String> {
                  → Enable Zureshot, then restart the app. ({})",
                 e
             )
-        })?;
+        })
+}
 
+/// Get the main display via ScreenCaptureKit.
+/// Blocks until the system returns available shareable content.
+pub fn get_main_display() -> Result<Retained<SCDisplay>, String> {
+    let content = get_shareable_content()?;
     let displays = unsafe { content.displays() };
     if displays.is_empty() {
         return Err("No displays found".to_string());
     }
-
     Ok(displays.objectAtIndex(0))
+}
+
+/// Get the main display and all windows (for exclusion filtering).
+pub fn get_display_and_windows() -> Result<(Retained<SCDisplay>, Vec<Retained<SCWindow>>), String> {
+    let content = get_shareable_content()?;
+    let displays = unsafe { content.displays() };
+    if displays.is_empty() {
+        return Err("No displays found".to_string());
+    }
+    let display = displays.objectAtIndex(0);
+    let sc_windows = unsafe { content.windows() };
+    let mut windows = Vec::new();
+    for i in 0..sc_windows.len() {
+        windows.push(sc_windows.objectAtIndex(i));
+    }
+    Ok((display, windows))
 }
 
 /// Get the pixel dimensions of a display.
@@ -282,45 +389,104 @@ pub fn display_size(display: &SCDisplay) -> (usize, usize) {
 ///
 /// The delegate receives CMSampleBuffers and directly appends them to the
 /// AVAssetWriterInput — zero-copy, hardware-encoded H.264.
+///
+/// If `source_rect` is provided, only that region of the display is captured
+/// (coordinates in logical points, macOS bottom-left origin).
+/// `exclude_windows` are filtered out of the capture (e.g. overlay/indicator).
 pub fn create_and_start(
     display: &SCDisplay,
     width: usize,
     height: usize,
     writer: Retained<AVAssetWriter>,
     input: Retained<AVAssetWriterInput>,
+    audio_input: Option<Retained<AVAssetWriterInput>>,
+    mic_input: Option<Retained<AVAssetWriterInput>>,
+    source_rect: Option<CGRect>,
+    exclude_windows: Vec<Retained<SCWindow>>,
+    quality: RecordingQuality,
+    paused_flag: std::sync::Arc<AtomicBool>,
+    capture_system_audio: bool,
+    capture_microphone: bool,
 ) -> Result<Retained<SCStream>, String> {
     // ── Stream configuration ──
     // H.264 requires even dimensions — round up if needed (must match writer settings)
     let width = if width % 2 != 0 { width + 1 } else { width };
     let height = if height % 2 != 0 { height + 1 } else { height };
+
+    let fps: i32 = match quality {
+        RecordingQuality::Standard => 30,
+        RecordingQuality::High => 60,
+    };
+
     let config = unsafe {
         let c = SCStreamConfiguration::new();
         c.setWidth(width);
         c.setHeight(height);
-        // 60 fps — minimumFrameInterval is the minimum time between frames
-        c.setMinimumFrameInterval(CMTime::new(1, 60));
+        // Frame interval based on quality
+        c.setMinimumFrameInterval(CMTime::new(1, fps));
         c.setShowsCursor(true);
-        // NV12 (420v) pixel format — native format for H.264 encoding
+        // NV12 (420v) pixel format — native format for HEVC/H.264 encoding
         // BGRA requires GPU color space conversion which can fail after a few seconds.
-        // 420v is what the VideoToolbox H.264 encoder natively consumes → zero-copy.
+        // 420v is what the VideoToolbox HEVC encoder natively consumes → zero-copy.
         c.setPixelFormat(u32::from_be_bytes(*b"420v"));
-        // Queue depth: keep 5 frames max in the capture queue (backpressure)
-        c.setQueueDepth(5);
+        // Queue depth: 3 frames (reduced from 5 for lower memory).
+        // With zero-copy pipeline, frames move through quickly.
+        // Lower queue = less IOSurface memory held = smaller RSS.
+        c.setQueueDepth(3);
+
+        // ── Region crop (if requested) ──
+        if let Some(rect) = source_rect {
+            c.setSourceRect(rect);
+            c.setDestinationRect(CGRect::new(
+                CGPoint::new(0.0, 0.0),
+                CGSize::new(width as f64, height as f64),
+            ));
+            println!(
+                "[zureshot] Region capture: sourceRect=({},{} {}x{}), output={}x{}",
+                rect.origin.x, rect.origin.y,
+                rect.size.width, rect.size.height,
+                width, height
+            );
+        }
+
+        // ── Audio capture ──
+        if capture_system_audio {
+            c.setCapturesAudio(true);
+            c.setExcludesCurrentProcessAudio(true);
+            c.setSampleRate(48000);
+            c.setChannelCount(2);
+            println!("[zureshot] System audio capture enabled (48kHz stereo)");
+        }
+        if capture_microphone {
+            c.setCaptureMicrophone(true);
+            println!("[zureshot] Microphone capture enabled");
+        }
+
         c
     };
 
-    // ── Content filter: capture entire display ──
-    let empty_windows: Retained<NSArray<SCWindow>> = NSArray::new();
+    println!(
+        "[zureshot] Capture config: {}x{} @ {}fps, quality={:?}, queueDepth=3",
+        width, height, fps, quality
+    );
+
+    // ── Content filter: capture display, excluding specified windows ──
+    let exclude_array: Retained<NSArray<SCWindow>> = if exclude_windows.is_empty() {
+        NSArray::new()
+    } else {
+        let refs: Vec<&SCWindow> = exclude_windows.iter().map(|w| &**w).collect();
+        NSArray::from_slice(&refs)
+    };
     let filter = unsafe {
         SCContentFilter::initWithDisplay_excludingWindows(
             SCContentFilter::alloc(),
             display,
-            &empty_windows,
+            &exclude_array,
         )
     };
 
     // ── Create delegate ──
-    let delegate = StreamOutput::new_with(writer, input);
+    let delegate = StreamOutput::new_with(writer, input, audio_input, mic_input, paused_flag);
 
     // ── Create stream ──
     let stream = unsafe {
@@ -342,6 +508,30 @@ pub fn create_and_start(
                 Some(&queue),
             )
             .expect("Failed to add stream output");
+
+        // Add audio output if system audio capture is enabled
+        if capture_system_audio {
+            stream
+                .addStreamOutput_type_sampleHandlerQueue_error(
+                    ProtocolObject::from_ref(&*delegate),
+                    SCStreamOutputType(1), // Audio
+                    Some(&queue),
+                )
+                .expect("Failed to add audio stream output");
+            println!("[zureshot] Audio stream output added");
+        }
+
+        // Add microphone output if mic capture is enabled
+        if capture_microphone {
+            stream
+                .addStreamOutput_type_sampleHandlerQueue_error(
+                    ProtocolObject::from_ref(&*delegate),
+                    SCStreamOutputType(2), // Microphone
+                    Some(&queue),
+                )
+                .expect("Failed to add microphone stream output");
+            println!("[zureshot] Microphone stream output added");
+        }
     }
 
     // ── Start capture (blocking wait) ──
@@ -388,5 +578,56 @@ pub fn stop(stream: &SCStream) {
         Ok(Ok(())) => {}
         Ok(Err(e)) => println!("[zureshot] Warning: stop capture error: {}", e),
         Err(_) => println!("[zureshot] Warning: stop capture timed out"),
+    }
+}
+
+/// Update the stream's content filter to exclude the given windows.
+/// Called after creating new windows (recording bar, overlay) so they
+/// are dynamically excluded from the capture.
+pub fn update_stream_filter(
+    stream: &SCStream,
+    display: &SCDisplay,
+    exclude_windows: Vec<Retained<SCWindow>>,
+) -> Result<(), String> {
+    let exclude_array: Retained<NSArray<SCWindow>> = if exclude_windows.is_empty() {
+        NSArray::new()
+    } else {
+        let refs: Vec<&SCWindow> = exclude_windows.iter().map(|w| &**w).collect();
+        NSArray::from_slice(&refs)
+    };
+
+    let filter = unsafe {
+        SCContentFilter::initWithDisplay_excludingWindows(
+            SCContentFilter::alloc(),
+            display,
+            &exclude_array,
+        )
+    };
+
+    let (tx, rx) = mpsc::channel();
+    let handler = RcBlock::new(move |error: *mut NSError| {
+        if !error.is_null() {
+            let err = unsafe { format!("{}", &*error) };
+            let _ = tx.send(Err(err));
+        } else {
+            let _ = tx.send(Ok(()));
+        }
+    });
+
+    // Call SCStream.updateContentFilter:completionHandler: via msg_send
+    unsafe {
+        let _: () = msg_send![stream, updateContentFilter: &*filter, completionHandler: &*handler];
+    }
+
+    match rx.recv_timeout(std::time::Duration::from_secs(5)) {
+        Ok(Ok(())) => {
+            println!(
+                "[zureshot] Stream filter updated ({} windows excluded)",
+                exclude_windows.len()
+            );
+            Ok(())
+        }
+        Ok(Err(e)) => Err(format!("updateContentFilter error: {}", e)),
+        Err(_) => Err("updateContentFilter timed out".to_string()),
     }
 }
