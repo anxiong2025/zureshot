@@ -24,6 +24,14 @@
 
 ## Why Zureshot?
 
+> **Z**ero-copy · p**ure** Rust · one **shot**
+
+The name says it all — **Zero + Pure + Shot**.
+
+**Zero** — zero-copy GPU pipeline. The CPU never touches a single pixel. 3% usage while recording.
+**Pure** — pure Rust, no Electron bloat. 3.9 MB installer, 11 MB on disk. Nothing wasted.
+**Shot** — one shot, instant capture. Click to record, done.
+
 Most screen recorders treat your Mac like a 2015 laptop — copying pixels through CPU, bloating memory, spinning fans.
 
 **Zureshot doesn't touch your pixels.** Every frame flows through a pure GPU pipeline, from capture to file. The result: recordings that look exactly like your screen, using almost no resources.
