@@ -27,11 +27,11 @@
       "icons/icon.icns"
     ],
     "macOS": {
-      "entitlements": null,
+      "entitlements": "Entitlements.plist",
       "exceptionDomain": null,
       "frameworks": [],
       "providerShortName": null,
-      "signingIdentity": null,
+      "signingIdentity": "-",
       "minimumSystemVersion": "12.3"
     }
   },

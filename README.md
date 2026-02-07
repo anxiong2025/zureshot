@@ -256,12 +256,47 @@ The `.dmg` installer will be in `src-tauri/target/release/bundle/dmg/`.
 
 ## 🗺 Roadmap
 
+### v0.2 — Trim & Export
+- [ ] Post-recording preview window
+- [ ] Drag-to-trim: start/end range slider
+- [ ] Stream copy export (no re-encoding, instant)
+- [ ] Optional hardware-accelerated 4K → 1080p transcode
+
+### v0.3 — Polish & Quality of Life
 - [ ] Multi-display selection
-- [ ] GIF / WebM export
-- [ ] Annotation tools (arrows, text, highlight)
-- [ ] Auto-upload to cloud
-- [ ] Thumbnail preview on stop
-- [ ] Global settings panel
+- [ ] Thumbnail preview on recording stop
+- [ ] Global settings panel (output path, format, quality)
+- [ ] Auto-open in Finder after export
+- [ ] Recording countdown timer (3-2-1)
+
+### v0.4 — Export Formats
+- [ ] GIF export (palette-optimized, max 30fps)
+- [ ] WebM / VP9 export
+- [ ] Screenshot mode (full screen / region)
+- [ ] Copy to clipboard
+
+### v0.5 — Annotation & Overlay
+- [ ] On-screen annotation: arrows, rectangles, text
+- [ ] Highlight / spotlight effect (dim outside cursor area)
+- [ ] Webcam overlay (picture-in-picture circle)
+- [ ] Customizable watermark
+
+### v1.0 — Presentation Mode 🎯
+- [ ] **Auto Zoom**: camera automatically follows cursor and zooms into the focused area — perfect for tutorials, demos, and walkthroughs
+- [ ] **Click Ripple**: visual ripple effect on mouse click to highlight interactions
+- [ ] **Keystroke Overlay**: display pressed keys on screen for shortcut demonstrations
+- [ ] **Spotlight Mode**: dim everything except a configurable radius around the cursor
+- [ ] **Smooth Pan**: cinematic camera movement with configurable easing curves
+- [ ] **Scene Presets**: save and switch between zoom levels / focus areas
+
+> **Vision**: Zureshot aims to become the go-to tool for developers and creators who record tutorials, product demos, and technical walkthroughs — combining pixel-perfect capture quality with intelligent presentation features that make every recording look professionally produced.
+
+### Future
+- [ ] Real-time LUT / color filters (Core Image or Metal Compute)
+- [ ] Auto-upload to cloud (S3, R2, custom endpoint)
+- [ ] Plugin system for custom post-processing
+- [ ] Apple Shortcuts integration
+- [ ] Menu bar recording indicator with live waveform
 
 ---
 
