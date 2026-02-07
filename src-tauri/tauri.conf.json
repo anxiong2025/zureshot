@@ -33,7 +33,11 @@
       "providerShortName": null,
       "signingIdentity": "-",
       "minimumSystemVersion": "12.3"
-    }
+    },
+    "resources": [
+      "icons/tray.png",
+      "icons/tray-recording.png"
+    ]
   },
   "plugins": {
     "shell": {

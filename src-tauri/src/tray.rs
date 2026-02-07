@@ -161,6 +161,13 @@ pub fn notify_recording_stopped(app: &AppHandle) {
     update_tray_icon(app, false);
 }
 
+/// Called from commands.rs when recording starts.
+/// Switches tray icon to recording state (red dot) and enables Stop menu.
+pub fn notify_recording_started(app: &AppHandle) {
+    update_menu_state(app, true);
+    update_tray_icon(app, true);
+}
+
 /// Handle menu item clicks
 fn handle_menu_event(app: &AppHandle, id: &str) {
     match id {

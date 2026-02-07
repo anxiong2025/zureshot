@@ -72,9 +72,7 @@
       : phase === 'adjusting'
   );
 
-  let isTooSmall = $derived(
-    phase === 'drawing' && (drawRect.width < MIN_SIZE || drawRect.height < MIN_SIZE)
-  );
+  let isTooSmall = $derived(false); // Click without drag now selects fullscreen, so never show "too small"
 
   // ─── Resize handles definition ───
   let handles = $derived(phase === 'adjusting' ? [
@@ -88,10 +86,10 @@
     { id: 'w',  x: rect.x, y: rect.y + rect.height / 2, cursor: 'ew-resize' },
   ] : []);
 
-  // ─── Toolbar position (below selection, centered) ───
+  // ─── Toolbar position (centered in selection, like CleanShot X) ───
   let toolbarPos = $derived({
     x: rect.x + rect.width / 2,
-    y: rect.y + rect.height + 16,
+    y: rect.y + rect.height / 2,
   });
 
   // ─── Event Handlers ───
@@ -149,9 +147,13 @@
         height: Math.abs(currentY - startY),
       };
 
-      // Too small → cancel this draw
+      // Too small (click without drag) → select entire screen (like CleanShot X)
       if (finalRect.width < MIN_SIZE || finalRect.height < MIN_SIZE) {
-        phase = 'idle';
+        selX = 0;
+        selY = 0;
+        selW = window.innerWidth;
+        selH = window.innerHeight;
+        phase = 'adjusting';
         return;
       }
 
@@ -296,16 +298,17 @@
 
   // ─── Actions ───
 
-  async function confirmSelection(quality) {
+  async function confirmSelection(format = 'video') {
     try {
       await invoke('confirm_region_selection', {
         x: selX,
         y: selY,
         width: selW,
         height: selH,
-        quality: quality || selectedQuality,
+        quality: selectedQuality,
         systemAudio: systemAudioEnabled,
         microphone: micEnabled,
+        format: format,
       });
     } catch (e) {
       console.error('Failed to confirm region selection:', e);
@@ -332,7 +335,7 @@
         cancel();
       }
     } else if (e.key === 'Enter' && phase === 'adjusting') {
-      confirmSelection();
+      confirmSelection('video');
     }
   }
 </script>
@@ -366,12 +369,12 @@
     {#if phase === 'drawing'}
       <div
         class="dimensions"
-        class:too-small-label={isTooSmall}
         style="left:{rect.x + rect.width / 2}px;top:{rect.y + rect.height + 10}px;"
       >
-        {Math.round(rect.width)} &times; {Math.round(rect.height)}
-        {#if isTooSmall}
-          <span class="min-hint">min {MIN_SIZE}×{MIN_SIZE}</span>
+        {#if drawRect.width < MIN_SIZE || drawRect.height < MIN_SIZE}
+          Fullscreen
+        {:else}
+          {Math.round(rect.width)} &times; {Math.round(rect.height)}
         {/if}
       </div>
     {/if}
@@ -529,8 +532,14 @@
 
           <div class="toolbar-sep"></div>
 
+          <!-- Record GIF button -->
+          <button class="btn-record-gif" onclick={() => confirmSelection('gif')}>
+            <span class="gif-badge">GIF</span>
+            Record GIF
+          </button>
+
           <!-- Record Video button -->
-          <button class="btn-record-video" onclick={() => confirmSelection()}>
+          <button class="btn-record-video" onclick={() => confirmSelection('video')}>
             <span class="rec-dot"></span>
             Record Video
           </button>
@@ -554,14 +563,14 @@
   <!-- Instructions -->
   {#if phase === 'idle'}
     <div class="instructions">
-      Click and drag to select recording region<br />
+      Click and drag to select region · Click to record fullscreen<br />
       <span class="hint">Press ESC to cancel</span>
     </div>
   {/if}
 
   {#if phase === 'adjusting'}
     <div class="instructions-bottom">
-      Drag to move · Handles to resize · <b>Enter</b> to record · <b>Esc</b> to reset
+      Drag to move · Handles to resize · <b>Enter</b> to record video · <b>Esc</b> to reset
     </div>
   {/if}
 </div>
@@ -654,20 +663,20 @@
     transform: translate(-50%, -50%) scale(1.3);
   }
 
-  /* ═══ Settings Toolbar ═══ */
+  /* ═══ Settings Toolbar (centered in selection) ═══ */
   .toolbar {
     position: absolute;
-    transform: translateX(-50%);
+    transform: translate(-50%, -50%);
     display: flex;
     flex-direction: column;
     gap: 4px;
     pointer-events: auto;
     z-index: 20;
-    animation: toolbar-in 0.15s ease-out;
+    animation: toolbar-in 0.2s ease-out;
   }
   @keyframes toolbar-in {
-    from { opacity: 0; transform: translateX(-50%) translateY(6px); }
-    to   { opacity: 1; transform: translateX(-50%) translateY(0); }
+    from { opacity: 0; transform: translate(-50%, -50%) scale(0.95); }
+    to   { opacity: 1; transform: translate(-50%, -50%) scale(1); }
   }
 
   .toolbar-row {
@@ -828,7 +837,48 @@
     color: rgba(59, 130, 246, 1);
   }
 
-  /* Record button */
+  /* Record GIF button */
+  .btn-record-gif {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 6px 14px;
+    border: none;
+    border-radius: 8px;
+    background: rgba(139, 92, 246, 0.9);
+    color: white;
+    font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Text', sans-serif;
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all 0.15s ease;
+    box-shadow: 0 2px 8px rgba(139, 92, 246, 0.3);
+    white-space: nowrap;
+  }
+  .btn-record-gif:hover {
+    background: rgba(124, 58, 237, 1);
+    transform: scale(1.02);
+    box-shadow: 0 3px 12px rgba(139, 92, 246, 0.4);
+  }
+  .btn-record-gif:active {
+    transform: scale(0.98);
+  }
+
+  .gif-badge {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    padding: 1px 4px;
+    border-radius: 3px;
+    background: rgba(255, 255, 255, 0.25);
+    font-size: 9px;
+    font-weight: 800;
+    letter-spacing: 0.5px;
+    line-height: 1.2;
+    flex-shrink: 0;
+  }
+
+  /* Record Video button */
   .btn-record-video {
     display: flex;
     align-items: center;

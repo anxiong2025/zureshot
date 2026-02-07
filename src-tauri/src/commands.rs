@@ -41,6 +41,8 @@ pub struct RecordingState {
     pub pause_start: Option<std::time::Instant>,
     pub region: Option<CaptureRegion>,
     pub quality: RecordingQuality,
+    /// Output format: "video" (MP4) or "gif" (record MP4, convert to GIF on stop)
+    pub output_format: String,
     /// Shared paused flag read by the capture delegate (AtomicBool behind Arc)
     pub paused_flag: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
@@ -61,6 +63,7 @@ impl Default for RecordingState {
             pause_start: None,
             region: None,
             quality: RecordingQuality::Standard,
+            output_format: "video".to_string(),
             paused_flag: None,
         }
     }
@@ -89,11 +92,19 @@ pub struct RecordingResult {
     pub file_size_bytes: u64,
 }
 
+/// GIF recording constraints (industry standard, matching CleanShot X)
+const GIF_MAX_DURATION_SECS: f64 = 30.0;
+const GIF_MAX_WIDTH: usize = 640;
+const GIF_FPS: u32 = 15;
+
 /// Payload emitted with `recording-started` event
 #[derive(Clone, Serialize, Deserialize)]
 pub struct RecordingStartedPayload {
     pub path: String,
     pub region: Option<CaptureRegion>,
+    pub format: String,
+    /// Max duration in seconds (0 = unlimited)
+    pub max_duration: f64,
 }
 
 /// Catch ObjC exceptions for a simple void call.
@@ -115,6 +126,7 @@ pub fn do_start_recording(
     quality: RecordingQuality,
     capture_system_audio: bool,
     capture_microphone: bool,
+    output_format: Option<String>,
 ) -> Result<String, String> {
     let state: tauri::State<'_, Mutex<RecordingState>> = app.state();
     let mut recording = state.lock().map_err(|e: std::sync::PoisonError<_>| e.to_string())?;
@@ -263,14 +275,22 @@ pub fn do_start_recording(
     recording.pause_start = None;
     recording.region = region.clone();
     recording.quality = quality;
+    recording.output_format = output_format.unwrap_or_else(|| "video".to_string());
     recording.paused_flag = Some(paused_flag);
 
     println!("[zureshot] Recording started!");
 
-    // Emit event to frontend with region info
+    // Switch tray icon to recording state (red dot + Stop enabled)
+    crate::tray::notify_recording_started(app);
+
+    // Emit event to frontend with region info and format
+    let fmt = recording.output_format.clone();
+    let max_dur = if fmt == "gif" { GIF_MAX_DURATION_SECS } else { 0.0 };
     let payload = RecordingStartedPayload {
         path: path.clone(),
         region,
+        format: fmt,
+        max_duration: max_dur,
     };
     let _ = app.emit("recording-started", &payload);
 
@@ -318,7 +338,7 @@ pub fn do_stop_recording(app: &AppHandle) -> Result<RecordingResult, String> {
     // BEFORE any blocking operations. Holding the mutex during GCD completion
     // handler waits can deadlock if the handler needs the main thread (which
     // Tauri sync commands also block on).
-    let (stream, writer, input, audio_input, mic_input, output_path, duration) = {
+    let (stream, writer, input, audio_input, mic_input, output_path, duration, output_format) = {
         let state: tauri::State<'_, Mutex<RecordingState>> = app.state();
         let mut recording = state.lock().map_err(|e: std::sync::PoisonError<_>| e.to_string())?;
 
@@ -344,6 +364,7 @@ pub fn do_stop_recording(app: &AppHandle) -> Result<RecordingResult, String> {
         let audio_input = recording.audio_input.take();
         let mic_input = recording.mic_input.take();
         let output_path = recording.output_path.take().unwrap_or_default();
+        let output_format = std::mem::replace(&mut recording.output_format, "video".to_string());
         recording.is_recording = false;
         recording.is_paused = false;
         recording.start_time = None;
@@ -353,7 +374,7 @@ pub fn do_stop_recording(app: &AppHandle) -> Result<RecordingResult, String> {
         recording.quality = RecordingQuality::Standard;
         recording.paused_flag = None;
 
-        (stream, writer, input, audio_input, mic_input, output_path, duration)
+        (stream, writer, input, audio_input, mic_input, output_path, duration, output_format)
     }; // ← mutex released here
 
     println!("[zureshot] Stopping recording after {:.1}s", duration);
@@ -387,10 +408,58 @@ pub fn do_stop_recording(app: &AppHandle) -> Result<RecordingResult, String> {
         );
     }
 
-    let file_size = std::fs::metadata(&output_path).map(|m| m.len()).unwrap_or(0);
+    // If format is GIF, convert MP4 → GIF using ffmpeg with palette optimization
+    let final_path = if output_format == "gif" {
+        let gif_path = output_path.replace(".mp4", ".gif");
+        println!("[zureshot] Converting MP4 to GIF: {} → {}", output_path, gif_path);
+
+        // Two-pass palette-optimized GIF for high quality:
+        // - Cap width at 640px (scale down large regions for reasonable file size)
+        // - fps=15 balances file size and smoothness
+        // - lanczos scaling for sharpness
+        // - palettegen+paletteuse for optimal color dithering
+        let vf = format!(
+            "fps={},scale='min({},iw)':-1:flags=lanczos,split[s0][s1];[s0]palettegen[p];[s1][p]paletteuse",
+            GIF_FPS, GIF_MAX_WIDTH
+        );
+        let ffmpeg_result = std::process::Command::new("ffmpeg")
+            .args([
+                "-i", &output_path,
+                "-t", &format!("{}", GIF_MAX_DURATION_SECS),
+                "-vf", &vf,
+                "-y",
+                &gif_path,
+            ])
+            .output();
+
+        match ffmpeg_result {
+            Ok(output) if output.status.success() => {
+                println!("[zureshot] GIF conversion successful");
+                // Delete the temporary MP4
+                let _ = std::fs::remove_file(&output_path);
+                gif_path
+            }
+            Ok(output) => {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                eprintln!("[zureshot] ffmpeg conversion failed: {}", stderr);
+                // Keep the MP4 as fallback
+                output_path
+            }
+            Err(e) => {
+                eprintln!("[zureshot] ffmpeg not found or failed to run: {}", e);
+                eprintln!("[zureshot] Install ffmpeg with: brew install ffmpeg");
+                // Keep the MP4 as fallback
+                output_path
+            }
+        }
+    } else {
+        output_path
+    };
+
+    let file_size = std::fs::metadata(&final_path).map(|m| m.len()).unwrap_or(0);
 
     let result = RecordingResult {
-        path: output_path.clone(),
+        path: final_path.clone(),
         duration_secs: duration,
         file_size_bytes: file_size,
     };
@@ -400,7 +469,7 @@ pub fn do_stop_recording(app: &AppHandle) -> Result<RecordingResult, String> {
 
     println!(
         "[zureshot] Recording complete: {} ({:.1}s, {:.1} MB)",
-        output_path,
+        final_path,
         duration,
         file_size as f64 / 1_048_576.0
     );
@@ -425,7 +494,7 @@ pub async fn start_recording(
     // deliver callbacks to Tokio-managed threads on macOS.
     let app_clone = app.clone();
     tokio::task::spawn_blocking(move || {
-        do_start_recording(&app_clone, output_path, None, RecordingQuality::Standard, false, false).map(|_| ())
+        do_start_recording(&app_clone, output_path, None, RecordingQuality::Standard, false, false, None).map(|_| ())
     })
     .await
     .map_err(|e| format!("Task join error: {e}"))?
@@ -580,6 +649,7 @@ pub fn confirm_region_selection(
     quality: Option<String>,
     system_audio: Option<bool>,
     microphone: Option<bool>,
+    format: Option<String>,
 ) -> Result<(), String> {
     // Hide the region selector (don't destroy — we're inside its IPC call).
     if let Some(win) = app.get_webview_window("region-selector") {
@@ -600,6 +670,7 @@ pub fn confirm_region_selection(
 
     let sys_audio = system_audio.unwrap_or(false);
     let mic = microphone.unwrap_or(false);
+    let output_format = format.unwrap_or_else(|| "video".to_string());
 
     let region_for_bar = region.clone();
     let region_for_overlay = region.clone();
@@ -613,7 +684,7 @@ pub fn confirm_region_selection(
             let _ = win.destroy();
         }
 
-        match do_start_recording(&app_clone, None, Some(region), q, sys_audio, mic) {
+        match do_start_recording(&app_clone, None, Some(region), q, sys_audio, mic, Some(output_format)) {
             Ok(_) => {
                 // Open the dim overlay and floating control bar
                 let _ = do_open_recording_overlay(&app_clone, &region_for_overlay);
@@ -710,7 +781,7 @@ pub fn do_open_recording_bar(app: &AppHandle, region: Option<&CaptureRegion>) ->
     let bar_width = 200.0;
     let bar_height = 48.0;
 
-    // Position: centered below the recorded region, or bottom-center of screen
+    // Position: smart placement based on region vs screen
     let monitor = app
         .primary_monitor()
         .map_err(|e| format!("Failed to get monitor: {}", e))?
@@ -721,16 +792,51 @@ pub fn do_open_recording_bar(app: &AppHandle, region: Option<&CaptureRegion>) ->
     let screen_h = phys_size.height as f64 / scale;
 
     let (pos_x, pos_y) = if let Some(rgn) = region {
-        // Center below the recorded region, 16px gap
-        let cx = rgn.x + rgn.width / 2.0 - bar_width / 2.0;
-        let cy = rgn.y + rgn.height + 16.0;
-        // Clamp to screen
-        let cx = cx.max(8.0).min(screen_w - bar_width - 8.0);
-        let cy = cy.max(8.0).min(screen_h - bar_height - 8.0);
-        (cx, cy)
+        // Check if region is effectively fullscreen (covers >90% of screen)
+        let is_fullscreen = rgn.width >= screen_w * 0.9 && rgn.height >= screen_h * 0.9;
+
+        if is_fullscreen {
+            // Fullscreen: bottom-center, above the Dock area
+            ((screen_w - bar_width) / 2.0, screen_h - bar_height - 80.0)
+        } else {
+            // Custom region: find the side with the most available space
+            let space_below = screen_h - (rgn.y + rgn.height);
+            let space_above = rgn.y;
+            let space_right = screen_w - (rgn.x + rgn.width);
+            let space_left = rgn.x;
+
+            let gap = 16.0;
+            let cx = rgn.x + rgn.width / 2.0 - bar_width / 2.0;
+
+            if space_below >= bar_height + gap + 20.0 {
+                // Below the region (preferred)
+                let x = cx.max(8.0).min(screen_w - bar_width - 8.0);
+                (x, rgn.y + rgn.height + gap)
+            } else if space_above >= bar_height + gap + 20.0 {
+                // Above the region
+                let x = cx.max(8.0).min(screen_w - bar_width - 8.0);
+                (x, rgn.y - bar_height - gap)
+            } else if space_right >= bar_width + gap + 20.0 {
+                // Right of the region
+                let y = (rgn.y + rgn.height / 2.0 - bar_height / 2.0)
+                    .max(8.0).min(screen_h - bar_height - 8.0);
+                (rgn.x + rgn.width + gap, y)
+            } else if space_left >= bar_width + gap + 20.0 {
+                // Left of the region
+                let y = (rgn.y + rgn.height / 2.0 - bar_height / 2.0)
+                    .max(8.0).min(screen_h - bar_height - 8.0);
+                (rgn.x - bar_width - gap, y)
+            } else {
+                // No good space outside: place inside at bottom-center of region
+                let x = cx.max(8.0).min(screen_w - bar_width - 8.0);
+                let y = (rgn.y + rgn.height - bar_height - gap)
+                    .max(8.0).min(screen_h - bar_height - 8.0);
+                (x, y)
+            }
+        }
     } else {
-        // Bottom-center for fullscreen recording
-        ((screen_w - bar_width) / 2.0, screen_h - bar_height - 60.0)
+        // No region at all: bottom-center
+        ((screen_w - bar_width) / 2.0, screen_h - bar_height - 80.0)
     };
 
     let window = WebviewWindowBuilder::new(
