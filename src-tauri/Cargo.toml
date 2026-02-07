@@ -1,6 +1,6 @@
 [package]
 name = "zureshot"
-version = "0.1.0"
+version = "0.2.0"
 description = "CleanShot X-style screen recorder for macOS"
 authors = ["robert"]
 edition = "2021"
