@@ -49,6 +49,11 @@ pub fn main() {
             commands::cancel_region_selection,
             commands::pause_recording,
             commands::resume_recording,
+            commands::start_screenshot_selection,
+            commands::take_screenshot,
+            commands::save_screenshot,
+            commands::copy_screenshot,
+            commands::dismiss_screenshot,
         ])
         // Tray-only app: use .build() + .run() to intercept ExitRequested.
         // This prevents Tauri from quitting when all windows are destroyed.

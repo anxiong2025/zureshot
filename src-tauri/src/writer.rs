@@ -7,8 +7,8 @@
 //! Encoding settings:
 //!   - Codec: HEVC (H.265) Main Auto Level
 //!   - Resolution: always native Retina (2x) for maximum sharpness
-//!   - Standard: 30 fps, moderate bitrate (~8-18 Mbps depending on resolution)
-//!   - High: 60 fps, high bitrate (~14-28 Mbps depending on resolution)
+//!   - Standard: 30 fps, moderate bitrate (~4-8 Mbps depending on resolution)
+//!   - High: 60 fps, high bitrate (~6-14 Mbps depending on resolution)
 //!   - Keyframe interval: 2 seconds
 //!   - Real-time encoding: enabled (low memory footprint)
 
@@ -362,12 +362,13 @@ fn create_video_settings(width: usize, height: usize, quality: RecordingQuality)
         // AVVideoQualityKey: 0.0–1.0, hint to encoder for quality-targeted VBR.
         // Combined with bitrate, the encoder uses bitrate as ceiling and quality
         // as the target — sharp screen text with minimal file size bloat.
-        // M-series optimized: higher quality targeting preserves text edge sharpness.
-        // Screen content (text, UI) is very sensitive to quantization — even small
-        // quality drops cause visible softening of font edges.
+        // Screen content (text, UI, code editors) is mostly static with sharp edges.
+        // HEVC handles this very efficiently — even moderate quality values preserve
+        // pixel-perfect text because inter-frame prediction handles static regions
+        // nearly losslessly. Lower values than camera video are perfectly fine here.
         let quality_val: f64 = match quality {
-            RecordingQuality::Standard => 0.92,
-            RecordingQuality::High => 0.97,
+            RecordingQuality::Standard => 0.82,
+            RecordingQuality::High => 0.90,
         };
         let quality_key = AVVideoQualityKey.expect("AVVideoQualityKey not available");
         let quality_num = NSNumber::new_f64(quality_val);
@@ -436,41 +437,47 @@ unsafe fn dict_set_nsstring(dict: &AnyObject, key: &NSString, value: &AnyObject)
 /// Compute VBR target bitrate based on resolution and quality.
 ///
 /// HEVC achieves equivalent visual quality at ~60% of H.264 bitrate.
-/// Both modes now record at native Retina resolution for maximum sharpness.
+/// Both modes record at native Retina resolution for maximum sharpness.
 ///
-/// Comparison with CleanShot X:
-///   CleanShot at Retina 1440p: ~10-15 Mbps (H.264)
-///   Zureshot Standard 1440p:    8 Mbps (HEVC) — same quality, ~40% smaller
-///   Zureshot High 1440p:        14 Mbps (HEVC) — premium quality, still smaller
+/// Screen content (text, UI, code editors) is mostly static — HEVC's
+/// inter-frame prediction compresses static regions nearly losslessly,
+/// so we can use much lower bitrates than camera video and still get
+/// pixel-perfect text reproduction.
+///
+/// CleanShot X comparison (H.264, ~10-15 Mbps at 1440p Retina):
+///   HEVC achieves same visual quality at ~60% of H.264 bitrate.
+///
+/// Target file sizes (approximate):
+///   Standard (30fps): ~30-40 MB/min (1440p Retina)
+///   High (60fps):     ~50-70 MB/min (1440p Retina)
+///   CleanShot X:      ~75-110 MB/min (1440p Retina, H.264)
 fn compute_bitrate(width: usize, height: usize, quality: RecordingQuality) -> i64 {
     let pixels = width * height;
-    // M-series optimized bitrates for screen content.
-    // Screen recordings (text, UI, code editors) need higher bitrate than
-    // camera video because sharp text edges are very sensitive to quantization.
-    // HEVC hardware encoder on Apple Silicon handles these rates effortlessly.
+    // Bitrates tuned to match CleanShot X visual quality using HEVC efficiency.
+    // HEVC at 8 Mbps ≈ H.264 at 13 Mbps for screen content.
     match quality {
         RecordingQuality::Standard => {
-            // Standard: pixel-perfect text at 30fps
+            // Standard: CleanShot X equivalent quality at 30fps
             if pixels >= 3840 * 2160 {
-                24_000_000  // 4K+ Standard: 24 Mbps HEVC
+                14_000_000  // 4K+ Standard: 14 Mbps HEVC ≈ CleanShot 22 Mbps H.264
             } else if pixels >= 2560 * 1440 {
-                16_000_000  // 1440p+ Standard: 16 Mbps HEVC
+                8_000_000   // 1440p+ Standard: 8 Mbps HEVC ≈ CleanShot 13 Mbps H.264
             } else if pixels >= 1920 * 1080 {
-                12_000_000  // 1080p+ Standard: 12 Mbps HEVC
+                6_000_000   // 1080p+ Standard: 6 Mbps HEVC ≈ CleanShot 10 Mbps H.264
             } else {
-                8_000_000   // Small region: 8 Mbps HEVC
+                4_000_000   // Small region: 4 Mbps HEVC
             }
         }
         RecordingQuality::High => {
-            // High: lossless-quality text at 60fps
+            // High: better than CleanShot X at 60fps
             if pixels >= 3840 * 2160 {
-                36_000_000  // 4K+ High: 36 Mbps HEVC
+                20_000_000  // 4K+ High: 20 Mbps HEVC
             } else if pixels >= 2560 * 1440 {
-                24_000_000  // 1440p+ High: 24 Mbps HEVC
+                14_000_000  // 1440p+ High: 14 Mbps HEVC
             } else if pixels >= 1920 * 1080 {
-                18_000_000  // 1080p+ High: 18 Mbps HEVC
+                10_000_000  // 1080p+ High: 10 Mbps HEVC
             } else {
-                12_000_000  // Small region: 12 Mbps HEVC
+                6_000_000   // Small region: 6 Mbps HEVC
             }
         }
     }

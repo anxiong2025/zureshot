@@ -37,6 +37,11 @@
   let systemAudioEnabled = $state(true);
   let selectedQuality = $state('standard'); // 'standard' | 'high'
 
+  // ─── Mode detection: 'record' or 'screenshot' ───
+  const urlParams = new URLSearchParams(window.location.search);
+  const mode = urlParams.get('mode') || 'record';  // default to record
+  const isScreenshot = mode === 'screenshot';
+
   // ─── Size presets ───
   let presetOpen = $state(false);
   const PRESETS = [
@@ -357,18 +362,27 @@
 
   async function confirmSelection(format = 'video') {
     try {
-      await invoke('confirm_region_selection', {
-        x: selX,
-        y: selY,
-        width: selW,
-        height: selH,
-        quality: selectedQuality,
-        systemAudio: systemAudioEnabled,
-        microphone: micEnabled,
-        format: format,
-      });
+      if (isScreenshot) {
+        await invoke('take_screenshot', {
+          x: selX,
+          y: selY,
+          width: selW,
+          height: selH,
+        });
+      } else {
+        await invoke('confirm_region_selection', {
+          x: selX,
+          y: selY,
+          width: selW,
+          height: selH,
+          quality: selectedQuality,
+          systemAudio: systemAudioEnabled,
+          microphone: micEnabled,
+          format: format,
+        });
+      }
     } catch (e) {
-      console.error('Failed to confirm region selection:', e);
+      console.error('Failed to confirm selection:', e);
     }
   }
 
@@ -396,7 +410,7 @@
         cancel();
       }
     } else if (e.key === 'Enter' && phase === 'adjusting') {
-      confirmSelection('video');
+      confirmSelection(isScreenshot ? 'screenshot' : 'video');
     }
   }
 </script>
@@ -519,6 +533,19 @@
           </button>
         </div>
 
+        <!-- Row 2: Audio toggles + Record button (record mode) or Screenshot button -->
+        {#if isScreenshot}
+        <div class="toolbar-row toolbar-bottom">
+          <!-- Screenshot capture button -->
+          <button class="btn-screenshot" onclick={() => confirmSelection('screenshot')}>
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M23 19a2 2 0 01-2 2H3a2 2 0 01-2-2V8a2 2 0 012-2h4l2-3h6l2 3h4a2 2 0 012 2z"/>
+              <circle cx="12" cy="13" r="4"/>
+            </svg>
+            Capture
+          </button>
+        </div>
+        {:else}
         <!-- Row 2: Audio toggles + Record button -->
         <div class="toolbar-row toolbar-bottom">
           <!-- Microphone toggle -->
@@ -605,6 +632,7 @@
             Video
           </button>
         </div>
+        {/if}
       </div>
     {/if}
   {:else}
@@ -624,14 +652,22 @@
   <!-- Instructions -->
   {#if phase === 'idle'}
     <div class="instructions">
-      Click and drag to select region · Click to record fullscreen<br />
+      {#if isScreenshot}
+        Click and drag to select region · Click for fullscreen screenshot<br />
+      {:else}
+        Click and drag to select region · Click to record fullscreen<br />
+      {/if}
       <span class="hint">Press ESC to cancel</span>
     </div>
   {/if}
 
   {#if phase === 'adjusting'}
     <div class="instructions-bottom">
-      Drag to move · Handles to resize · <b>Enter</b> to record video · <b>Esc</b> to reset
+      {#if isScreenshot}
+        Drag to move · Handles to resize · <b>Enter</b> to capture · <b>Esc</b> to reset
+      {:else}
+        Drag to move · Handles to resize · <b>Enter</b> to record video · <b>Esc</b> to reset
+      {/if}
     </div>
   {/if}
 </div>
@@ -952,6 +988,34 @@
   .btn-record-video:active {
     transform: scale(0.97);
     background: rgba(59, 130, 246, 0.38);
+  }
+
+  /* Screenshot button */
+  .btn-screenshot {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    padding: 5px 14px;
+    border: 1px solid rgba(52, 211, 153, 0.35);
+    border-radius: 8px;
+    background: rgba(16, 185, 129, 0.18);
+    color: rgba(167, 243, 208, 0.95);
+    font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Text', sans-serif;
+    font-size: 12px;
+    font-weight: 600;
+    letter-spacing: 0.2px;
+    cursor: pointer;
+    transition: all 0.15s ease;
+    white-space: nowrap;
+  }
+  .btn-screenshot:hover {
+    background: rgba(16, 185, 129, 0.3);
+    border-color: rgba(52, 211, 153, 0.55);
+    color: #d1fae5;
+  }
+  .btn-screenshot:active {
+    transform: scale(0.97);
+    background: rgba(16, 185, 129, 0.38);
   }
 
   /* ─── Crosshair (idle) ─── */

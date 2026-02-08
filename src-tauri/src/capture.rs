@@ -27,6 +27,136 @@ use objc2_core_graphics::kCGColorSpaceSRGB;
 use objc2_core_media::CMTime;
 use serde::{Deserialize, Serialize};
 
+// ── Screenshot support ────────────────────────────────────────────────
+
+/// Take a screenshot of a specific screen region using CoreGraphics.
+/// `region` is in logical (CSS) points. Returns the PNG file path.
+pub fn take_screenshot_region(
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+    output_path: &str,
+) -> Result<(usize, usize, u64), String> {
+    // CoreGraphics foreign functions
+    extern "C" {
+        fn CGWindowListCreateImage(
+            screenBounds: CGRect,
+            listOption: u32,
+            windowID: u32,
+            imageOption: u32,
+        ) -> *const std::ffi::c_void; // CGImageRef
+
+        fn CGImageGetWidth(image: *const std::ffi::c_void) -> usize;
+        fn CGImageGetHeight(image: *const std::ffi::c_void) -> usize;
+        fn CGImageRelease(image: *const std::ffi::c_void);
+
+        fn CGImageDestinationCreateWithURL(
+            url: *const std::ffi::c_void,
+            image_type: *const std::ffi::c_void,
+            count: usize,
+            options: *const std::ffi::c_void,
+        ) -> *const std::ffi::c_void;
+        fn CGImageDestinationAddImage(
+            dest: *const std::ffi::c_void,
+            image: *const std::ffi::c_void,
+            properties: *const std::ffi::c_void,
+        );
+        fn CGImageDestinationFinalize(dest: *const std::ffi::c_void) -> bool;
+
+        fn CFRelease(cf: *const std::ffi::c_void);
+    }
+
+    // CFSTR helper — create a CFString from a Rust &str
+    fn cfstring(s: &str) -> *const std::ffi::c_void {
+        extern "C" {
+            fn CFStringCreateWithBytes(
+                alloc: *const std::ffi::c_void,
+                bytes: *const u8,
+                num_bytes: isize,
+                encoding: u32,
+                is_external: bool,
+            ) -> *const std::ffi::c_void;
+        }
+        unsafe {
+            CFStringCreateWithBytes(
+                std::ptr::null(),
+                s.as_ptr(),
+                s.len() as isize,
+                0x08000100, // kCFStringEncodingUTF8
+                false,
+            )
+        }
+    }
+
+    fn cfurl_from_path(path: &str) -> *const std::ffi::c_void {
+        extern "C" {
+            fn CFURLCreateWithFileSystemPath(
+                alloc: *const std::ffi::c_void,
+                file_path: *const std::ffi::c_void,
+                path_style: isize,
+                is_directory: bool,
+            ) -> *const std::ffi::c_void;
+        }
+        let cf_path = cfstring(path);
+        let url = unsafe {
+            CFURLCreateWithFileSystemPath(std::ptr::null(), cf_path, 0, false)
+        };
+        unsafe { CFRelease(cf_path); }
+        url
+    }
+
+    let rect = CGRect::new(
+        CGPoint::new(x, y),
+        CGSize::new(width, height),
+    );
+
+    // kCGWindowListOptionOnScreenOnly = 1, kCGWindowImageDefault = 0
+    let image = unsafe {
+        CGWindowListCreateImage(rect, 1, 0, 0)
+    };
+
+    if image.is_null() {
+        return Err("Failed to capture screenshot (CGWindowListCreateImage returned null)".into());
+    }
+
+    let img_width = unsafe { CGImageGetWidth(image) };
+    let img_height = unsafe { CGImageGetHeight(image) };
+
+    // Write to PNG file using ImageIO
+    let url = cfurl_from_path(output_path);
+    let png_type = cfstring("public.png");
+
+    let dest = unsafe {
+        CGImageDestinationCreateWithURL(url, png_type, 1, std::ptr::null())
+    };
+
+    if dest.is_null() {
+        unsafe {
+            CGImageRelease(image);
+            CFRelease(url);
+            CFRelease(png_type);
+        }
+        return Err("Failed to create image destination".into());
+    }
+
+    unsafe {
+        CGImageDestinationAddImage(dest, image, std::ptr::null());
+        let ok = CGImageDestinationFinalize(dest);
+        CFRelease(dest);
+        CGImageRelease(image);
+        CFRelease(url);
+        CFRelease(png_type);
+        if !ok {
+            return Err("Failed to write PNG file".into());
+        }
+    }
+
+    let file_size = std::fs::metadata(output_path).map(|m| m.len()).unwrap_or(0);
+
+    Ok((img_width, img_height, file_size))
+}
+
 /// Recording quality presets.
 ///
 /// Both modes capture at native Retina resolution for maximum sharpness.
@@ -37,9 +167,9 @@ use serde::{Deserialize, Serialize};
 ///   High:     native 2880×1800 @ 60fps → ~7.4 MB/frame × 3 queue = ~22 MB buffers
 ///
 /// File size (HEVC, 60s recording at 2880×1800):
-///   Standard (30fps, 10 Mbps): ~75 MB/min
-///   High (60fps, 18 Mbps):     ~135 MB/min
-///   CleanShot X (H.264):       ~120-180 MB/min
+///   Standard (30fps, 8 Mbps):  ~30-40 MB/min
+///   High (60fps, 14 Mbps):     ~50-70 MB/min
+///   CleanShot X (H.264):       ~75-110 MB/min
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, Default, PartialEq)]
 pub enum RecordingQuality {
     /// Standard: native Retina resolution, 30 fps, HEVC.

@@ -951,3 +951,236 @@ pub fn refresh_stream_exclusion(app: &AppHandle) -> Result<(), String> {
 
     capture::update_stream_filter(&stream, &display, exclude_windows)
 }
+
+// ════════════════════════════════════════════════════════════════════════
+//  Screenshot commands
+// ════════════════════════════════════════════════════════════════════════
+
+/// Result of a screenshot capture
+#[derive(Clone, Serialize, Deserialize)]
+pub struct ScreenshotResult {
+    pub path: String,
+    pub width: usize,
+    pub height: usize,
+    pub file_size_bytes: u64,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub image_base64: String,
+}
+
+/// Open the region selector in screenshot mode.
+pub fn do_start_screenshot_selection(app: &AppHandle) -> Result<(), String> {
+    // If a region-selector window already exists, just show + focus it
+    if let Some(win) = app.get_webview_window("region-selector") {
+        let _ = win.show();
+        let _ = win.set_focus();
+        return Ok(());
+    }
+
+    let monitor = app
+        .primary_monitor()
+        .map_err(|e| format!("Failed to get monitor: {}", e))?
+        .ok_or("No primary monitor found")?;
+    let phys_size = monitor.size();
+    let scale = monitor.scale_factor();
+    let position = monitor.position();
+    let logical_w = phys_size.width as f64 / scale;
+    let logical_h = phys_size.height as f64 / scale;
+
+    // Pass mode=screenshot via URL query parameter
+    let window = WebviewWindowBuilder::new(
+        app,
+        "region-selector",
+        WebviewUrl::App("region-selector.html?mode=screenshot".into()),
+    )
+    .title("Screenshot Region")
+    .inner_size(logical_w, logical_h)
+    .position(position.x as f64 / scale, position.y as f64 / scale)
+    .transparent(true)
+    .decorations(false)
+    .always_on_top(true)
+    .skip_taskbar(true)
+    .resizable(false)
+    .build()
+    .map_err(|e| format!("Failed to create region selector window: {}", e))?;
+
+    let _ = window.show();
+    let _ = window.set_focus();
+
+    println!("[zureshot] Screenshot region selector opened");
+    Ok(())
+}
+
+/// Tauri command: open screenshot region selector
+#[tauri::command]
+pub async fn start_screenshot_selection(app: AppHandle) -> Result<(), String> {
+    do_start_screenshot_selection(&app)
+}
+
+/// Tauri command: take a screenshot of the selected region
+#[tauri::command]
+pub async fn take_screenshot(
+    app: AppHandle,
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+) -> Result<ScreenshotResult, String> {
+    // Close region selector immediately
+    if let Some(win) = app.get_webview_window("region-selector") {
+        let _ = win.hide();
+        // Destroy after a tiny delay so the window disappears from the capture
+        let app2 = app.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            if let Some(win) = app2.get_webview_window("region-selector") {
+                let _ = win.destroy();
+            }
+        });
+    }
+
+    // Small delay to ensure region-selector is fully hidden
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    // Generate temp file path
+    let timestamp = chrono::Local::now().format("%Y%m%d_%H%M%S");
+    let base = dirs::download_dir()
+        .or_else(dirs::home_dir)
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let zureshot_dir = base.join("Zureshot");
+    let _ = std::fs::create_dir_all(&zureshot_dir);
+    let temp_path = zureshot_dir
+        .join(format!(".zureshot_screenshot_{}.png", timestamp))
+        .to_string_lossy()
+        .to_string();
+
+    // Capture
+    let (img_w, img_h, file_size) = capture::take_screenshot_region(x, y, width, height, &temp_path)?;
+
+    // Read file and encode as base64 for preview
+    let file_bytes = std::fs::read(&temp_path)
+        .map_err(|e| format!("Failed to read screenshot file: {}", e))?;
+    let image_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &file_bytes);
+
+    let result = ScreenshotResult {
+        path: temp_path.clone(),
+        width: img_w,
+        height: img_h,
+        file_size_bytes: file_size,
+        image_base64: image_b64,
+    };
+
+    println!(
+        "[zureshot] Screenshot taken: {}x{} ({:.1} KB) → {}",
+        img_w, img_h,
+        file_size as f64 / 1024.0,
+        temp_path
+    );
+
+    // Show screenshot preview window
+    let is_new = do_open_screenshot_preview(&app).unwrap_or(false);
+
+    // If window was just created, wait for the webview to load and register listeners
+    if is_new {
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+
+    // Emit event to the preview window
+    let _ = app.emit("screenshot-taken", &result);
+
+    Ok(result)
+}
+
+/// Tauri command: save screenshot to permanent location (move from temp)
+#[tauri::command]
+pub async fn save_screenshot(path: String) -> Result<String, String> {
+    let src = std::path::Path::new(&path);
+    if !src.exists() {
+        return Err("Screenshot file not found".into());
+    }
+
+    // Rename from hidden temp file (.zureshot_screenshot_...) to final name
+    let filename = src
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
+    let final_name = filename.trim_start_matches('.');
+    let dest = src.parent().unwrap().join(final_name);
+
+    std::fs::rename(&path, &dest).map_err(|e| format!("Failed to save screenshot: {}", e))?;
+
+    let dest_str = dest.to_string_lossy().to_string();
+    println!("[zureshot] Screenshot saved: {}", dest_str);
+    Ok(dest_str)
+}
+
+/// Tauri command: copy screenshot to clipboard
+#[tauri::command]
+pub async fn copy_screenshot(path: String) -> Result<(), String> {
+    let src = std::path::Path::new(&path);
+    if !src.exists() {
+        return Err("Screenshot file not found".into());
+    }
+
+    // Use NSPasteboard to copy the image to clipboard (macOS)
+    #[cfg(target_os = "macos")]
+    {
+        // Use osascript to set clipboard to the image file — simple & reliable
+        let script = format!(
+            "set the clipboard to (read (POSIX file \"{}\") as «class PNGf»)",
+            path
+        );
+        let output = std::process::Command::new("osascript")
+            .args(["-e", &script])
+            .output()
+            .map_err(|e| format!("Failed to run osascript: {}", e))?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(format!("Failed to copy to clipboard: {}", stderr));
+        }
+    }
+
+    // Clean up temp file after copying
+    let _ = std::fs::remove_file(&path);
+    println!("[zureshot] Screenshot copied to clipboard and temp file removed");
+    Ok(())
+}
+
+/// Tauri command: dismiss screenshot (delete temp file)
+#[tauri::command]
+pub async fn dismiss_screenshot(path: String) -> Result<(), String> {
+    let _ = std::fs::remove_file(&path);
+    println!("[zureshot] Screenshot dismissed, temp file removed");
+    Ok(())
+}
+
+/// Open the screenshot preview window (bottom-left floating)
+fn do_open_screenshot_preview(app: &AppHandle) -> Result<bool, String> {
+    if let Some(win) = app.get_webview_window("screenshot-preview") {
+        let _ = win.show();
+        let _ = win.set_focus();
+        return Ok(false); // Window already existed
+    }
+
+    let window = WebviewWindowBuilder::new(
+        app,
+        "screenshot-preview",
+        WebviewUrl::App("screenshot-preview.html".into()),
+    )
+    .title("Screenshot")
+    .inner_size(260.0, 170.0)
+    .position(20.0, 600.0) // Will be repositioned by frontend
+    .transparent(true)
+    .decorations(false)
+    .always_on_top(true)
+    .skip_taskbar(true)
+    .resizable(false)
+    .build()
+    .map_err(|e| format!("Failed to create screenshot preview: {}", e))?;
+
+    let _ = window.show();
+    let _ = window.set_focus();
+
+    Ok(true) // Newly created
+}

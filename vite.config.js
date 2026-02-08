@@ -27,6 +27,7 @@ export default defineConfig({
         'recording-bar': resolve(__dirname, 'recording-bar.html'),
         'recording-overlay': resolve(__dirname, 'recording-overlay.html'),
         countdown: resolve(__dirname, 'countdown.html'),
+        'screenshot-preview': resolve(__dirname, 'screenshot-preview.html'),
       },
     },
   },

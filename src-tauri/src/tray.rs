@@ -139,6 +139,13 @@ fn show_info_dialog(title: &str, message: &str) {
 
 /// Build the tray menu with correct enabled/disabled states
 fn build_menu(app: &AppHandle, is_recording: bool) -> Result<Menu<tauri::Wry>, Box<dyn std::error::Error>> {
+    let screenshot_region = MenuItem::with_id(
+        app,
+        "screenshot_region",
+        "Screenshot Region",
+        !is_recording,
+        Some("CmdOrCtrl+Shift+A"),
+    )?;
     let record_region = MenuItem::with_id(
         app,
         "record_region",
@@ -182,6 +189,7 @@ fn build_menu(app: &AppHandle, is_recording: bool) -> Result<Menu<tauri::Wry>, B
     let menu = Menu::with_items(
         app,
         &[
+            &screenshot_region,
             &record_region,
             &stop_recording,
             &separator,
@@ -350,6 +358,12 @@ pub fn auto_check_update(app: &AppHandle) {
 /// Handle menu item clicks
 fn handle_menu_event(app: &AppHandle, id: &str) {
     match id {
+        "screenshot_region" => {
+            match commands::do_start_screenshot_selection(app) {
+                Ok(()) => println!("[zureshot] Screenshot region selector opened via menu"),
+                Err(e) => eprintln!("[zureshot] Screenshot region selection error: {}", e),
+            }
+        }
         "record_region" => {
             match commands::do_start_region_selection(app) {
                 Ok(()) => println!("[zureshot] Region selector opened via menu"),
