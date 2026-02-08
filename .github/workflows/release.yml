@@ -13,14 +13,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # macOS Apple Silicon
+          # macOS Universal (Apple Silicon + Intel in one binary)
           - platform: macos-latest
-            args: '--target aarch64-apple-darwin'
-            target: aarch64-apple-darwin
-          # macOS Intel
-          - platform: macos-latest
-            args: '--target x86_64-apple-darwin'
-            target: x86_64-apple-darwin
+            args: '--target universal-apple-darwin'
+            target: universal-apple-darwin
 
     runs-on: ${{ matrix.platform }}
     steps:
@@ -39,7 +35,7 @@ jobs:
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.target }}
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
 
       - name: Rust cache
         uses: swatinem/rust-cache@v2
@@ -58,7 +54,18 @@ jobs:
         with:
           tagName: v__VERSION__
           releaseName: 'Zureshot v__VERSION__'
-          releaseBody: 'See the assets to download this version and install.'
+          releaseBody: |
+            ## 🎉 Zureshot v__VERSION__
+
+            ### 下载安装
+            下载 `.dmg` 文件，打开后拖入 Applications 即可。
+            **适用于所有 Mac（Apple Silicon M1/M2/M3/M4 及 Intel）**
+
+            ### 更新说明
+            如果你已安装 Zureshot，应用会自动检测并提示更新。
+
+            ---
+            > macOS 可能提示"无法验证开发者"，请在「系统设置 → 隐私与安全性」中点击「仍要打开」。
           releaseDraft: true
           prerelease: false
           args: ${{ matrix.args }}
