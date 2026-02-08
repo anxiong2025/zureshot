@@ -15,6 +15,7 @@ use tauri::Manager;
 pub fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
             // Initialize recording state
             app.manage(Mutex::new(RecordingState::default()));
@@ -31,6 +32,9 @@ pub fn main() {
 
             println!("[zureshot] App started, tray icon ready");
             println!("[zureshot] Click tray icon or use menu to start recording");
+
+            // Auto-check for updates on startup
+            tray::auto_check_update(app.handle());
 
             Ok(())
         })
