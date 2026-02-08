@@ -13,10 +13,14 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # macOS Universal (Apple Silicon + Intel in one binary)
+          # macOS Apple Silicon (M1/M2/M3/M4)
           - platform: macos-latest
-            args: '--target universal-apple-darwin'
-            target: universal-apple-darwin
+            args: '--target aarch64-apple-darwin'
+            target: aarch64-apple-darwin
+          # macOS Intel
+          - platform: macos-latest
+            args: '--target x86_64-apple-darwin'
+            target: x86_64-apple-darwin
 
     runs-on: ${{ matrix.platform }}
     steps:
@@ -35,7 +39,7 @@ jobs:
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: aarch64-apple-darwin,x86_64-apple-darwin
+          targets: ${{ matrix.target }}
 
       - name: Rust cache
         uses: swatinem/rust-cache@v2
@@ -56,8 +60,12 @@ jobs:
           releaseName: 'Zureshot v__VERSION__'
           releaseBody: |
             ### 📥 Download & Install
-            Download the `.dmg`, open it and drag Zureshot into your Applications folder.
-            **Works on all Macs (Apple Silicon M1/M2/M3/M4 & Intel)**
+            Download the `.dmg` for your Mac, open it and drag Zureshot into Applications.
+            - **Apple Silicon (M1/M2/M3/M4):** `Zureshot_*_aarch64.dmg`
+            - **Intel Mac:** `Zureshot_*_x64.dmg`
+
+            ### 🔄 Update
+            If you already have Zureshot installed, the app will automatically detect and prompt you to update.
 
             > ⚠️ macOS may show "unverified developer" warning. Go to **System Settings → Privacy & Security** and click **Open Anyway**.
           releaseDraft: true
