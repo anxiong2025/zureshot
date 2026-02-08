@@ -1,10 +1,12 @@
 //! ScreenCaptureKit capture pipeline — zero-copy screen recording.
 //!
-//! Architecture:
+//! Architecture (Apple Silicon exclusive):
 //!   SCStream → CMSampleBuffer (IOSurface-backed, GPU memory)
-//!            → AVAssetWriterInput → VideoToolbox H.264 encode → MP4
+//!            → AVAssetWriterInput → VideoToolbox HEVC encode → MP4
 //!
-//! No CPU-side pixel copying in the entire path.
+//! Entire path runs on M-series media engine — zero CPU pixel copying.
+//! With real-time zoom, sourceRect changes are handled by the GPU compositor
+//! at no measurable cost.
 
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::mpsc;
@@ -79,6 +81,9 @@ pub struct StreamOutputIvars {
     pts_skip_count: AtomicU64,
     /// Shared paused flag — when true, frames are dropped (not written to file).
     paused: std::sync::Arc<AtomicBool>,
+    /// Shared slot for pushing IOSurface to the preview window (if active).
+    /// When Some, each captured frame's IOSurface is pushed here for zero-copy preview.
+    preview_surface: Option<std::sync::Arc<std::sync::atomic::AtomicPtr<std::ffi::c_void>>>,
 }
 
 define_class!(
@@ -193,6 +198,26 @@ define_class!(
                 );
             }
 
+            // ── 3b. Diagnostic: log pixel buffer dimensions for first few frames ──
+            {
+                let n = ivars.frame_count.load(Ordering::Relaxed);
+                if n < 3 {
+                    if let Some(ref pixel_buf) = has_image {
+                        extern "C" {
+                            fn CVPixelBufferGetWidth(pb: *const std::ffi::c_void) -> usize;
+                            fn CVPixelBufferGetHeight(pb: *const std::ffi::c_void) -> usize;
+                        }
+                        let pb_ptr = (&**pixel_buf) as *const _ as *const std::ffi::c_void;
+                        let pb_w = unsafe { CVPixelBufferGetWidth(pb_ptr) };
+                        let pb_h = unsafe { CVPixelBufferGetHeight(pb_ptr) };
+                        println!(
+                            "[zureshot] Frame #{}: pixelBuffer={}x{}, PTS={}/{}",
+                            n, pb_w, pb_h, pts_value, pts_timescale
+                        );
+                    }
+                }
+            }
+
             // ── 4. Append frame to writer (zero-copy) ──
             unsafe {
                 let ready: bool = msg_send![&*ivars.input, isReadyForMoreMediaData];
@@ -203,6 +228,24 @@ define_class!(
                         ivars.last_pts_value.store(pts_value, Ordering::Relaxed);
                         ivars.last_pts_timescale.store(pts_timescale as i64, Ordering::Relaxed);
                         ivars.frames_inc();
+
+                        // Push IOSurface to preview window (if active)
+                        if let Some(ref slot) = ivars.preview_surface {
+                            // Extract IOSurface from CVPixelBuffer (zero-copy)
+                            extern "C" {
+                                fn CVPixelBufferGetIOSurface(
+                                    pixel_buffer: *const std::ffi::c_void,
+                                ) -> *mut std::ffi::c_void;
+                            }
+                            if let Some(ref pixel_buf) = sample_buffer.image_buffer() {
+                                let surface = CVPixelBufferGetIOSurface(
+                                    (&**pixel_buf) as *const _ as *const std::ffi::c_void,
+                                );
+                                if !surface.is_null() {
+                                    crate::preview::PreviewWindow::push_surface(slot, surface);
+                                }
+                            }
+                        }
                     } else {
                         // Writer entered failed state — log full error ONCE
                         if !ivars.error_logged.swap(true, Ordering::Relaxed) {
@@ -368,6 +411,7 @@ impl StreamOutput {
         audio_input: Option<Retained<AVAssetWriterInput>>,
         mic_input: Option<Retained<AVAssetWriterInput>>,
         paused: std::sync::Arc<AtomicBool>,
+        preview_surface: Option<std::sync::Arc<std::sync::atomic::AtomicPtr<std::ffi::c_void>>>,
     ) -> Retained<Self> {
         let this = Self::alloc().set_ivars(StreamOutputIvars {
             writer,
@@ -384,6 +428,7 @@ impl StreamOutput {
             last_pts_timescale: AtomicI64::new(0),
             pts_skip_count: AtomicU64::new(0),
             paused,
+            preview_surface,
         });
         unsafe { msg_send![super(this), init] }
     }
@@ -531,6 +576,7 @@ pub fn create_and_start(
     paused_flag: std::sync::Arc<AtomicBool>,
     capture_system_audio: bool,
     capture_microphone: bool,
+    preview_surface: Option<std::sync::Arc<std::sync::atomic::AtomicPtr<std::ffi::c_void>>>,
 ) -> Result<Retained<SCStream>, String> {
     // ── Stream configuration ──
     // H.264 requires even dimensions — round up if needed (must match writer settings)
@@ -553,10 +599,10 @@ pub fn create_and_start(
         // BGRA requires GPU color space conversion which can fail after a few seconds.
         // 420v is what the VideoToolbox HEVC encoder natively consumes → zero-copy.
         c.setPixelFormat(u32::from_be_bytes(*b"420v"));
-        // Queue depth: 3 frames (reduced from 5 for lower memory).
-        // With zero-copy pipeline, frames move through quickly.
-        // Lower queue = less IOSurface memory held = smaller RSS.
-        c.setQueueDepth(3);
+        // Queue depth: 2 frames — minimum for smooth pipeline.
+        // Lower queue = fewer IOSurfaces held in GPU memory.
+        // Each Retina frame (e.g. 2880x1800 NV12) is ~7.5 MB → 2 frames ≈ 15 MB.
+        c.setQueueDepth(2);
 
         // ── M-series optimization: force maximum physical pixel resolution ──
         // SCCaptureResolutionBest forces capture at native Retina pixels (e.g. 3200×2132)
@@ -582,12 +628,15 @@ pub fn create_and_start(
                 CGPoint::new(0.0, 0.0),
                 CGSize::new(width as f64, height as f64),
             ));
-            // Disable scaling-to-fit for region capture.
-            // When sourceRect physical pixels == destinationRect, we want 1:1 pixel
-            // mapping with no bilinear/bicubic interpolation that causes blur.
-            c.setScalesToFit(false);
+            // scalesToFit=true: scale sourceRect content to fill destinationRect.
+            // sourceRect is in logical points (e.g. 1544×916), output is physical
+            // pixels (e.g. 3088×1832). With Retina 2x, the scale factor is exactly
+            // 1.0 (logical×2 == physical) — so no interpolation/blur occurs.
+            // Without this, SCStream places logical-sized content into the physical
+            // pixel buffer without scaling, leaving 3/4 of the frame black.
+            c.setScalesToFit(true);
             println!(
-                "[zureshot] Region capture: sourceRect=({},{} {}x{}), output={}x{}, scalesToFit=false",
+                "[zureshot] Region capture: sourceRect=({},{} {}x{}), output={}x{}, scalesToFit=true",
                 rect.origin.x, rect.origin.y,
                 rect.size.width, rect.size.height,
                 width, height
@@ -639,7 +688,7 @@ pub fn create_and_start(
     };
 
     // ── Create delegate ──
-    let delegate = StreamOutput::new_with(writer, input, audio_input, mic_input, paused_flag);
+    let delegate = StreamOutput::new_with(writer, input, audio_input, mic_input, paused_flag, preview_surface);
 
     // ── Create stream ──
     let stream = unsafe {
@@ -704,6 +753,47 @@ pub fn create_and_start(
         .map_err(|_| "Capture start channel closed".to_string())?
         .map_err(|e| format!("Failed to start capture: {}", e))?;
 
+    // ── CRITICAL: Kick sourceRect via updateConfiguration ──
+    // SCStream::initWithFilter_configuration_delegate does NOT reliably apply
+    // sourceRect/destinationRect/scalesToFit from the initial configuration.
+    // A single updateConfiguration call after startCapture "activates" them.
+    //
+    // IMPORTANT: SCStreamConfiguration::new() defaults capturesAudio=false.
+    // updateConfiguration applies ALL properties from the new config, including
+    // defaults — so we MUST re-specify audio settings or audio gets killed.
+    if source_rect.is_some() {
+        let kick_config = unsafe {
+            let c = SCStreamConfiguration::new();
+            c.setWidth(width);
+            c.setHeight(height);
+            if let Some(rect) = source_rect {
+                c.setSourceRect(rect);
+            }
+            c.setDestinationRect(CGRect::new(
+                CGPoint::new(0.0, 0.0),
+                CGSize::new(width as f64, height as f64),
+            ));
+            c.setScalesToFit(true);
+            // Re-specify audio settings (defaults are all false/0)
+            if capture_system_audio || capture_microphone {
+                c.setSampleRate(48000);
+                c.setChannelCount(2);
+            }
+            if capture_system_audio {
+                c.setCapturesAudio(true);
+                c.setExcludesCurrentProcessAudio(true);
+            }
+            if capture_microphone {
+                c.setCaptureMicrophone(true);
+            }
+            c
+        };
+        unsafe {
+            stream.updateConfiguration_completionHandler(&kick_config, None);
+        }
+        println!("[zureshot] sourceRect activated via updateConfiguration");
+    }
+
     // The stream retains the delegate via addStreamOutput.
     // We must NOT drop the Rust Retained<StreamOutput> early though,
     // as that would decrement the refcount. Leak it — the stream owns it now.
@@ -737,6 +827,7 @@ pub fn stop(stream: &SCStream) {
 /// Update the stream's content filter to exclude the given windows.
 /// Called after creating new windows (recording bar, overlay) so they
 /// are dynamically excluded from the capture.
+#[allow(dead_code)]
 pub fn update_stream_filter(
     stream: &SCStream,
     display: &SCDisplay,

@@ -4,8 +4,12 @@
 
 mod capture;
 mod commands;
+#[allow(dead_code)]
+mod cursor;
+mod preview;
 mod tray;
 mod writer;
+mod zoom;
 
 use commands::RecordingState;
 use std::sync::Mutex;

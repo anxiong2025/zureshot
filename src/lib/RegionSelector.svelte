@@ -36,6 +36,7 @@
   let micEnabled = $state(false);
   let systemAudioEnabled = $state(true);
   let selectedQuality = $state('standard'); // 'standard' | 'high'
+  let zoomEnabled = $state(false); // Auto-zoom effect (Screen Studio style) — off by default
 
   // ─── Size presets ───
   let presetOpen = $state(false);
@@ -366,6 +367,7 @@
         systemAudio: systemAudioEnabled,
         microphone: micEnabled,
         format: format,
+        zoom: zoomEnabled,
       });
     } catch (e) {
       console.error('Failed to confirm region selection:', e);
@@ -583,6 +585,33 @@
               onclick={() => selectedQuality = 'high'}
             >HD</button>
           </div>
+
+          <div class="toolbar-sep"></div>
+
+          <!-- Zoom effect toggle -->
+          <button
+            class="toolbar-btn audio-btn zoom-btn"
+            class:active={zoomEnabled}
+            title={zoomEnabled ? 'Disable auto-zoom effect' : 'Enable auto-zoom effect (follows cursor)'}
+            onclick={() => zoomEnabled = !zoomEnabled}
+          >
+            {#if zoomEnabled}
+              <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
+                <circle cx="7" cy="7" r="5" stroke="currentColor" stroke-width="1.4" fill="none"/>
+                <line x1="11" y1="11" x2="15" y2="15" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/>
+                <line x1="5" y1="7" x2="9" y2="7" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/>
+                <line x1="7" y1="5" x2="7" y2="9" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/>
+              </svg>
+            {:else}
+              <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
+                <circle cx="7" cy="7" r="5" stroke="currentColor" stroke-width="1.4" fill="none" opacity="0.4"/>
+                <line x1="11" y1="11" x2="15" y2="15" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" opacity="0.4"/>
+                <line x1="5" y1="7" x2="9" y2="7" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" opacity="0.4"/>
+                <line x1="7" y1="5" x2="7" y2="9" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" opacity="0.4"/>
+              </svg>
+            {/if}
+            <span class="audio-label">Zoom</span>
+          </button>
 
           <div class="toolbar-sep"></div>
 

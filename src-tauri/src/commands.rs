@@ -5,6 +5,7 @@
 use crate::capture;
 use crate::capture::RecordingQuality;
 use crate::writer;
+use crate::zoom;
 use objc2::rc::Retained;
 use objc2_av_foundation::{AVAssetWriter, AVAssetWriterInput};
 use objc2_core_foundation::{CGPoint, CGRect, CGSize};
@@ -45,6 +46,19 @@ pub struct RecordingState {
     pub output_format: String,
     /// Shared paused flag read by the capture delegate (AtomicBool behind Arc)
     pub paused_flag: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// Whether zoom effect is enabled for this recording
+    pub zoom_enabled: bool,
+    /// Real-time zoom controller (updates SCStream sourceRect during recording)
+    pub zoom_controller: Option<zoom::ZoomController>,
+    /// Video dimensions in physical pixels
+    pub video_width: usize,
+    pub video_height: usize,
+    /// Retina scale factor (e.g. 2.0 for Retina displays)
+    pub retina_scale: f64,
+    /// Whether system audio capture is active (needed for config reapply)
+    pub capture_system_audio: bool,
+    /// Whether microphone capture is active (needed for config reapply)
+    pub capture_microphone: bool,
 }
 
 impl Default for RecordingState {
@@ -65,6 +79,13 @@ impl Default for RecordingState {
             quality: RecordingQuality::Standard,
             output_format: "video".to_string(),
             paused_flag: None,
+            zoom_enabled: false,
+            zoom_controller: None,
+            video_width: 0,
+            video_height: 0,
+            retina_scale: 1.0,
+            capture_system_audio: false,
+            capture_microphone: false,
         }
     }
 }
@@ -127,6 +148,7 @@ pub fn do_start_recording(
     capture_system_audio: bool,
     capture_microphone: bool,
     output_format: Option<String>,
+    zoom_enabled: bool,
 ) -> Result<String, String> {
     let state: tauri::State<'_, Mutex<RecordingState>> = app.state();
     let mut recording = state.lock().map_err(|e: std::sync::PoisonError<_>| e.to_string())?;
@@ -268,6 +290,7 @@ pub fn do_start_recording(
         paused_flag.clone(),
         capture_system_audio,
         capture_microphone,
+        None, // no preview surface
     )
     .map_err(|e| {
         eprintln!("[zureshot] {}", e);
@@ -275,7 +298,7 @@ pub fn do_start_recording(
     })?;
 
     // Update state
-    recording.stream = Some(stream);
+    recording.stream = Some(stream.clone());
     recording.writer = Some(writer);
     recording.input = Some(input);
     recording.audio_input = audio_input;
@@ -290,6 +313,36 @@ pub fn do_start_recording(
     recording.quality = quality;
     recording.output_format = output_format.unwrap_or_else(|| "video".to_string());
     recording.paused_flag = Some(paused_flag);
+    recording.zoom_enabled = zoom_enabled;
+    recording.video_width = width;
+    recording.video_height = height;
+    recording.retina_scale = retina_scale as f64;
+    recording.capture_system_audio = capture_system_audio;
+    recording.capture_microphone = capture_microphone;
+
+    // Start real-time zoom controller
+    // The controller runs a background thread that dynamically updates
+    // SCStream's sourceRect to follow the cursor with spring physics.
+    if zoom_enabled {
+        if let Some(ref rgn) = region {
+            let config = zoom::ZoomConfig::default();
+            let controller = zoom::ZoomController::start(
+                stream,
+                (rgn.x, rgn.y),
+                (rgn.width, rgn.height),
+                width,
+                height,
+                config,
+                capture_system_audio,
+                capture_microphone,
+            );
+            recording.zoom_controller = Some(controller);
+            println!("[zureshot] Real-time zoom started for region ({:.0},{:.0} {:.0}x{:.0})",
+                rgn.x, rgn.y, rgn.width, rgn.height);
+        } else {
+            println!("[zureshot] Zoom requires region recording — skipping for fullscreen");
+        }
+    }
 
     println!(
         "[zureshot] Recording started! systemAudio={}, mic={}, audioInput={}, micInput={}",
@@ -357,7 +410,7 @@ pub fn do_stop_recording(app: &AppHandle) -> Result<RecordingResult, String> {
     // BEFORE any blocking operations. Holding the mutex during GCD completion
     // handler waits can deadlock if the handler needs the main thread (which
     // Tauri sync commands also block on).
-    let (stream, writer, input, audio_input, mic_input, output_path, duration, output_format) = {
+    let (stream, writer, input, audio_input, mic_input, output_path, duration, output_format, zoom_controller) = {
         let state: tauri::State<'_, Mutex<RecordingState>> = app.state();
         let mut recording = state.lock().map_err(|e: std::sync::PoisonError<_>| e.to_string())?;
 
@@ -384,6 +437,7 @@ pub fn do_stop_recording(app: &AppHandle) -> Result<RecordingResult, String> {
         let mic_input = recording.mic_input.take();
         let output_path = recording.output_path.take().unwrap_or_default();
         let output_format = std::mem::replace(&mut recording.output_format, "video".to_string());
+        let zoom_controller = recording.zoom_controller.take();
         recording.is_recording = false;
         recording.is_paused = false;
         recording.start_time = None;
@@ -392,11 +446,25 @@ pub fn do_stop_recording(app: &AppHandle) -> Result<RecordingResult, String> {
         recording.region = None;
         recording.quality = RecordingQuality::Standard;
         recording.paused_flag = None;
+        recording.zoom_enabled = false;
+        recording.video_width = 0;
+        recording.video_height = 0;
+        recording.retina_scale = 1.0;
+        recording.capture_system_audio = false;
+        recording.capture_microphone = false;
 
-        (stream, writer, input, audio_input, mic_input, output_path, duration, output_format)
+        (stream, writer, input, audio_input, mic_input, output_path, duration, output_format, zoom_controller)
     }; // ← mutex released here
 
     println!("[zureshot] Stopping recording after {:.1}s", duration);
+
+    // ── Stop real-time zoom controller ──
+    // Must stop BEFORE stopping the stream so the controller can restore
+    // the original sourceRect. The zoom was applied in real-time via
+    // SCStream.updateConfiguration() — no post-processing needed.
+    if let Some(controller) = zoom_controller {
+        controller.stop();
+    }
 
     // Close the recording bar and dim overlay windows
     if let Some(win) = app.get_webview_window("recording-bar") {
@@ -426,6 +494,10 @@ pub fn do_stop_recording(app: &AppHandle) -> Result<RecordingResult, String> {
             mic_input.as_deref(),
         );
     }
+
+    // No zoom post-processing needed — zoom was applied in real-time
+    // via SCStream.updateConfiguration() during recording.
+    let output_path = output_path;
 
     // If format is GIF, convert MP4 → GIF using ffmpeg with palette optimization
     let final_path = if output_format == "gif" {
@@ -513,7 +585,7 @@ pub async fn start_recording(
     // deliver callbacks to Tokio-managed threads on macOS.
     let app_clone = app.clone();
     tokio::task::spawn_blocking(move || {
-        do_start_recording(&app_clone, output_path, None, RecordingQuality::Standard, false, false, None).map(|_| ())
+        do_start_recording(&app_clone, output_path, None, RecordingQuality::Standard, false, false, None, false).map(|_| ())
     })
     .await
     .map_err(|e| format!("Task join error: {e}"))?
@@ -669,6 +741,7 @@ pub fn confirm_region_selection(
     system_audio: Option<bool>,
     microphone: Option<bool>,
     format: Option<String>,
+    zoom: Option<bool>,
 ) -> Result<(), String> {
     // Hide the region selector (don't destroy — we're inside its IPC call).
     if let Some(win) = app.get_webview_window("region-selector") {
@@ -690,34 +763,58 @@ pub fn confirm_region_selection(
     let sys_audio = system_audio.unwrap_or(false);
     let mic = microphone.unwrap_or(false);
     let output_format = format.unwrap_or_else(|| "video".to_string());
+    let zoom_enabled = zoom.unwrap_or(false);
 
     let region_for_bar = region.clone();
     let region_for_overlay = region.clone();
     let app_clone = app.clone();
     std::thread::spawn(move || {
-        // Small delay to let the region selector fully disappear
-        std::thread::sleep(std::time::Duration::from_millis(300));
+        // 1. Hide region selector immediately (before destroying)
+        if let Some(win) = app_clone.get_webview_window("region-selector") {
+            let _ = win.hide();
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
 
-        // Now safe to destroy region-selector
+        // 2. Destroy old windows — region selector + any leftover from previous recording
         if let Some(win) = app_clone.get_webview_window("region-selector") {
             let _ = win.destroy();
         }
+        if let Some(win) = app_clone.get_webview_window("recording-bar") {
+            let _ = win.destroy();
+        }
+        if let Some(win) = app_clone.get_webview_window("recording-overlay") {
+            let _ = win.destroy();
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
 
-        match do_start_recording(&app_clone, None, Some(region), q, sys_audio, mic, Some(output_format)) {
+        // 3. Create overlay + bar BEFORE starting capture.
+        //    This way, when capture starts, collect_app_windows_to_exclude()
+        //    will already see these windows and exclude them from the initial
+        //    SCContentFilter — NO updateContentFilter needed after start.
+        //    This avoids the race condition where updateContentFilter resets
+        //    sourceRect config and causes black/frozen frames.
+        let _ = do_open_recording_overlay(&app_clone, &region_for_overlay);
+        let _ = do_open_recording_bar(&app_clone, Some(&region_for_bar));
+
+        // 4. Wait for WindowServer to register the new windows
+        std::thread::sleep(std::time::Duration::from_millis(200));
+
+        // 5. Start recording — windows are already excluded in initial filter
+        match do_start_recording(&app_clone, None, Some(region), q, sys_audio, mic, Some(output_format), zoom_enabled) {
             Ok(_) => {
-                // Open the dim overlay and floating control bar
-                let _ = do_open_recording_overlay(&app_clone, &region_for_overlay);
-                let _ = do_open_recording_bar(&app_clone, Some(&region_for_bar));
-
-                // Brief delay for windows to register with WindowServer,
-                // then refresh the stream filter to exclude them from capture
-                std::thread::sleep(std::time::Duration::from_millis(150));
-                let _ = refresh_stream_exclusion(&app_clone);
-
                 // Send region coordinates to the overlay for the dim effect
                 let _ = app_clone.emit("recording-region", &region_for_overlay);
             }
-            Err(e) => eprintln!("[zureshot] Start error: {}", e),
+            Err(e) => {
+                eprintln!("[zureshot] Start error: {}", e);
+                // Clean up overlay/bar on failure
+                if let Some(win) = app_clone.get_webview_window("recording-bar") {
+                    let _ = win.destroy();
+                }
+                if let Some(win) = app_clone.get_webview_window("recording-overlay") {
+                    let _ = win.destroy();
+                }
+            }
         }
     });
 
@@ -928,9 +1025,92 @@ pub fn do_open_recording_overlay(app: &AppHandle, region: &CaptureRegion) -> Res
     Ok(())
 }
 
+/// Reapply the full SCStream configuration via updateConfiguration.
+///
+/// MUST be called after `refresh_stream_exclusion` (updateContentFilter),
+/// because updateContentFilter resets sourceRect/destinationRect/scalesToFit
+/// to defaults, causing black frames in region capture.
+///
+/// This function reads the recording state to reconstruct the complete config
+/// including sourceRect, audio settings, pixel format, etc.
+#[allow(dead_code)]
+pub fn reapply_stream_config(app: &AppHandle) -> Result<(), String> {
+    use objc2_core_foundation::{CGPoint, CGRect, CGSize};
+    use objc2_core_media::CMTime;
+    use objc2_screen_capture_kit::SCStreamConfiguration;
+    use objc2_screen_capture_kit::SCCaptureResolutionType;
+    use objc2_core_graphics::kCGColorSpaceSRGB;
+
+    let (stream, region, width, height, quality, sys_audio, mic) = {
+        let state: tauri::State<'_, Mutex<RecordingState>> = app.state();
+        let recording = state.lock().map_err(|e| e.to_string())?;
+        let stream = recording.stream.as_ref().cloned()
+            .ok_or("No active stream to reapply config")?;
+        let region = recording.region.clone();
+        (stream, region, recording.video_width, recording.video_height,
+         recording.quality, recording.capture_system_audio, recording.capture_microphone)
+    };
+
+    let fps: i32 = match quality {
+        RecordingQuality::Standard => 30,
+        RecordingQuality::High => 60,
+    };
+
+    let config = unsafe {
+        let c = SCStreamConfiguration::new();
+        c.setWidth(width);
+        c.setHeight(height);
+        c.setMinimumFrameInterval(CMTime::new(1, fps));
+        c.setShowsCursor(true);
+        c.setPixelFormat(u32::from_be_bytes(*b"420v"));
+        c.setQueueDepth(2);
+        c.setCaptureResolution(SCCaptureResolutionType::Best);
+        c.setColorSpaceName(kCGColorSpaceSRGB);
+        c.setShouldBeOpaque(true);
+
+        if let Some(ref rgn) = region {
+            c.setSourceRect(CGRect::new(
+                CGPoint::new(rgn.x, rgn.y),
+                CGSize::new(rgn.width, rgn.height),
+            ));
+            c.setDestinationRect(CGRect::new(
+                CGPoint::new(0.0, 0.0),
+                CGSize::new(width as f64, height as f64),
+            ));
+            c.setScalesToFit(true);
+        }
+
+        // Preserve audio settings
+        if sys_audio || mic {
+            c.setSampleRate(48000);
+            c.setChannelCount(2);
+        }
+        if sys_audio {
+            c.setCapturesAudio(true);
+            c.setExcludesCurrentProcessAudio(true);
+        }
+        if mic {
+            c.setCaptureMicrophone(true);
+        }
+        c
+    };
+
+    unsafe {
+        stream.updateConfiguration_completionHandler(&config, None);
+    }
+
+    println!(
+        "[zureshot] Stream config reapplied after filter update: {}x{} @ {}fps, region={}, audio={}, mic={}",
+        width, height, fps, region.is_some(), sys_audio, mic
+    );
+
+    Ok(())
+}
+
 /// Refresh the SCStream content filter to exclude all windows belonging to our PID.
 /// Called after creating new windows (recording bar, dim overlay) so they don't
 /// appear in the captured video.
+#[allow(dead_code)]
 pub fn refresh_stream_exclusion(app: &AppHandle) -> Result<(), String> {
     // Clone the stream handle while holding the lock briefly
     let stream = {
