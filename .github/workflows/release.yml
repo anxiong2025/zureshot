@@ -55,17 +55,11 @@ jobs:
           tagName: v__VERSION__
           releaseName: 'Zureshot v__VERSION__'
           releaseBody: |
-            ## 🎉 Zureshot v__VERSION__
+            ### 📥 Download & Install
+            Download the `.dmg`, open it and drag Zureshot into your Applications folder.
+            **Works on all Macs (Apple Silicon M1/M2/M3/M4 & Intel)**
 
-            ### 下载安装
-            下载 `.dmg` 文件，打开后拖入 Applications 即可。
-            **适用于所有 Mac（Apple Silicon M1/M2/M3/M4 及 Intel）**
-
-            ### 更新说明
-            如果你已安装 Zureshot，应用会自动检测并提示更新。
-
-            ---
-            > macOS 可能提示"无法验证开发者"，请在「系统设置 → 隐私与安全性」中点击「仍要打开」。
+            > ⚠️ macOS may show "unverified developer" warning. Go to **System Settings → Privacy & Security** and click **Open Anyway**.
           releaseDraft: true
           prerelease: false
           args: ${{ matrix.args }}
