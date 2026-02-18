@@ -437,12 +437,14 @@ fn add_audio_branch(
     println!("[zureshot-linux] Adding {label} branch → mux.{mux_pad_name}");
 
     // Audio source
-    let mut src_builder = gst::ElementFactory::make("pulsesrc");
+    // Note: monitor_source must be declared before src_builder so it outlives
+    // the ElementBuilder borrow (variables drop in reverse declaration order).
     let monitor_source = if is_system_audio {
         get_default_monitor_source()
     } else {
         None
     };
+    let mut src_builder = gst::ElementFactory::make("pulsesrc");
     if let Some(ref monitor) = monitor_source {
         src_builder = src_builder.property("device", monitor.as_str());
     }

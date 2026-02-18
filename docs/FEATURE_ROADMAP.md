@@ -10,10 +10,10 @@
 
 ```
 v0.5.1-beta  当前版本 ✅  Linux 首发 + 跨平台基础
-v0.6.0       摄像头气泡 + 截图钉 + 粗剪
+v0.6.0       摄像头气泡 + 截图钉
 v0.7.0       虚拟背景 + OCR 文字提取
 v0.8.0       实时标注 + 演示增强
-v0.9.0       LUT 滤镜 + 云端分享
+v0.9.0       粗剪导出 + LUT 滤镜 + 云端分享
 v1.0.0       稳定版发布
 ```
 
@@ -34,9 +34,9 @@ v1.0.0       稳定版发布
 
 ---
 
-## 🎥 v0.6.0 — 摄像头气泡 + 截图钉 + 粗剪导出
+## 🎥 v0.6.0 — 摄像头气泡 + 截图钉
 
-> 预估工时：**3-5 天**
+> 预估工时：**2-3 天**
 > 核心卖点：摄像头圆形浮窗——这是 Loom/Screen Studio 的标志性功能
 > 跨平台：WebView + getUserMedia，macOS 和 Linux 共用同一套前端代码
 
@@ -95,23 +95,6 @@ camera-overlay.html (独立 WebView 窗口)
 - [ ] **B.3** ScreenshotPreview 添加 "📌 Pin" 按钮
   - 截图预览窗口 → 点击 📌 → 关闭预览 → 打开 Pin 窗口
 - [ ] **B.4** 快捷键：`CmdOrCtrl+Shift+P` 钉住最近一张截图
-
-### Phase C：粗剪导出（Quick Trim & Export）
-
-> 录制结束后快速修剪首尾 → 导出 MP4/GIF
-
-- [ ] **C.1** 创建 `trim-preview.html` + `TrimPreview.svelte`
-  - 内嵌 `<video>` 播放器
-  - 双滑块 Range Slider（起始帧 / 结束帧）
-  - 实时预览修剪区间
-- [ ] **C.2** Rust 端：`trim_video(input, start, end, output)` 命令
-  - macOS: AVAssetExportSession stream copy（极速无重编码）
-  - Linux: ffmpeg -ss -to -c copy（同样零重编码）
-- [ ] **C.3** GIF 导出优化
-  - 调色板优化（two-pass palettegen + paletteuse）
-  - 最高 30fps，自动降帧
-  - 文件大小预估
-- [ ] **C.4** 录制结束自动弹出 Trim 窗口（可在设置中关闭）
 
 ---
 
@@ -231,24 +214,42 @@ Linux: Tesseract.js (WASM，纯前端)
 
 ---
 
-## 🎨 v0.9.0 — LUT 滤镜 + 云端分享
+## 🎨 v0.9.0 — 粗剪导出 + LUT 滤镜 + 云端分享
 
-> 预估工时：**5-7 天**
+> 预估工时：**7-10 天**
+> 核心卖点：后期处理与导出全流程——修剪、滤镜、分享一站式完成
 
-### Phase H：LUT 滤镜
+### Phase H：粗剪导出（Quick Trim & Export）
 
-- [ ] **H.1** 解析 `.cube` LUT 文件
-- [ ] **H.2** macOS: Core Image `CIColorCubeWithColorSpace` 实时滤镜
-- [ ] **H.3** Linux: GStreamer `videobalance` + 自定义色彩映射
-- [ ] **H.4** 预设滤镜库：电影感 / 复古 / 高对比 / 暖色 / 冷色
-- [ ] **H.5** 导出时应用滤镜（后处理，不影响录制性能）
+> 录制结束后快速修剪首尾 → 导出 MP4/GIF
 
-### Phase I：云端分享
+- [ ] **H.1** 创建 `trim-preview.html` + `TrimPreview.svelte`
+  - 内嵌 `<video>` 播放器
+  - 双滑块 Range Slider（起始帧 / 结束帧）
+  - 实时预览修剪区间
+- [ ] **H.2** Rust 端：`trim_video(input, start, end, output)` 命令
+  - macOS: AVAssetExportSession stream copy（极速无重编码）
+  - Linux: ffmpeg -ss -to -c copy（同样零重编码）
+- [ ] **H.3** GIF 导出优化
+  - 调色板优化（two-pass palettegen + paletteuse）
+  - 最高 30fps，自动降帧
+  - 文件大小预估
+- [ ] **H.4** 录制结束自动弹出 Trim 窗口（可在设置中关闭）
 
-- [ ] **I.1** 一键上传到云端（S3/R2/自定义端点）
-- [ ] **I.2** 生成分享链接（类似 Loom/CleanShot Cloud）
-- [ ] **I.3** 链接有效期设置（1天/7天/30天/永久）
-- [ ] **I.4** 自托管方案（用户自建存储后端）
+### Phase I：LUT 滤镜
+
+- [ ] **I.1** 解析 `.cube` LUT 文件
+- [ ] **I.2** macOS: Core Image `CIColorCubeWithColorSpace` 实时滤镜
+- [ ] **I.3** Linux: GStreamer `videobalance` + 自定义色彩映射
+- [ ] **I.4** 预设滤镜库：电影感 / 复古 / 高对比 / 暖色 / 冷色
+- [ ] **I.5** 导出时应用滤镜（后处理，不影响录制性能）
+
+### Phase J：云端分享
+
+- [ ] **J.1** 一键上传到云端（S3/R2/自定义端点）
+- [ ] **J.2** 生成分享链接（类似 Loom/CleanShot Cloud）
+- [ ] **J.3** 链接有效期设置（1天/7天/30天/永久）
+- [ ] **J.4** 自托管方案（用户自建存储后端）
 
 ---
 
@@ -280,7 +281,7 @@ Linux: Tesseract.js (WASM，纯前端)
 | 录屏 | ✅ | ✅ | ✅ | ✅ |
 | 摄像头气泡 | ❌ | ✅ | ✅ | 📋 v0.6.0 |
 | 截图钉桌面 | ✅ | ❌ | ❌ | 📋 v0.6.0 |
-| 粗剪导出 | ✅ | ✅ | ✅ | 📋 v0.6.0 |
+| 粗剪导出 | ✅ | ✅ | ✅ | 📋 v0.9.0 |
 | 虚拟背景 | ❌ | ✅ | ✅ | 📋 v0.7.0 |
 | OCR 文字识别 | ✅ | ❌ | ❌ | 📋 v0.7.0 |
 | 实时标注 | ✅ (截图) | ❌ | ❌ | 📋 v0.8.0 (录屏) |
