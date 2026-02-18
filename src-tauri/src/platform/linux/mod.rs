@@ -12,7 +12,6 @@ pub mod capture;
 pub mod portal;
 pub mod writer;
 
-use std::os::fd::AsRawFd;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};

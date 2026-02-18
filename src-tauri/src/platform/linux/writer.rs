@@ -14,7 +14,6 @@
 //!   [pulsesrc → audioconvert → audioresample → capsfilter
 //!     → avenc_aac → aacparse → mp4mux]
 
-use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 
 use gstreamer as gst;
@@ -439,10 +438,13 @@ fn add_audio_branch(
 
     // Audio source
     let mut src_builder = gst::ElementFactory::make("pulsesrc");
-    if is_system_audio {
-        if let Some(monitor) = get_default_monitor_source() {
-            src_builder = src_builder.property("device", &monitor);
-        }
+    let monitor_source = if is_system_audio {
+        get_default_monitor_source()
+    } else {
+        None
+    };
+    if let Some(ref monitor) = monitor_source {
+        src_builder = src_builder.property("device", monitor.as_str());
     }
     let audio_src = src_builder
         .build()

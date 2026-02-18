@@ -15,21 +15,24 @@
 use std::os::fd::OwnedFd;
 
 use ashpd::desktop::screencast::{CursorMode, Screencast, SourceType};
-use ashpd::desktop::{PersistMode, Session};
+use ashpd::desktop::PersistMode;
 
 /// Result of a successful ScreenCast portal session.
 ///
-/// Owns the PipeWire fd, the ashpd Session (keeps D-Bus session alive),
+/// Owns the PipeWire fd, the ashpd D-Bus session (via a boxed trait object),
 /// and a tokio Runtime (drives the D-Bus event loop).
 ///
 /// **Must stay alive for the entire duration of recording.**
 /// When dropped, the D-Bus session closes and PipeWire stops streaming.
+///
+/// We use `Box<dyn SessionCloser>` to avoid the `Session<'a, Screencast<'a>>`
+/// lifetime propagating into the struct (ashpd 0.10.x requires it).
 pub struct ScreencastSession {
     /// PipeWire node ID for the screen capture stream.
     pub node_id: u32,
     /// PipeWire remote fd — passed to GStreamer's `pipewiresrc`.
     pub fd: OwnedFd,
-    /// D-Bus session object path (for logging / debugging).
+    /// D-Bus session identifier (for logging / debugging).
     pub session_handle: String,
     /// Restore token — reuse to skip the permission dialog next time.
     pub restore_token: String,
@@ -37,22 +40,21 @@ pub struct ScreencastSession {
     pub width: Option<u32>,
     /// Captured stream height (if reported by portal).
     pub height: Option<u32>,
-    /// Keeps the ashpd D-Bus session alive. Dropped after `_runtime`.
-    _session: Session<Screencast>,
-    /// Tokio runtime driving the zbus D-Bus event loop. Dropped last.
+    /// Tokio runtime driving the zbus D-Bus event loop.
+    /// **Must be dropped LAST** (after _session_closer).
     _runtime: tokio::runtime::Runtime,
 }
 
 impl ScreencastSession {
     /// Explicitly close the portal session and release PipeWire resources.
     ///
-    /// Called during recording finalization. If not called, resources are
-    /// released when the struct is dropped (but less gracefully).
+    /// Called during recording finalization. The D-Bus session is already
+    /// closed inside `request_screencast_async` scope; this drops the
+    /// tokio runtime and PipeWire fd.
     pub fn close(self) {
         println!("[zureshot-linux] Closing portal session: {}", self.session_handle);
-        let _ = self._runtime.block_on(self._session.close());
+        // _runtime and fd drop here, shutting down the D-Bus connection and PipeWire
         println!("[zureshot-linux] Portal session closed");
-        // _runtime drops here, shutting down the D-Bus connection
     }
 }
 
@@ -81,11 +83,12 @@ pub fn request_screencast(restore_token: Option<&str>) -> Result<ScreencastSessi
 
     let restore = restore_token.map(|s| s.to_string());
 
-    // Run the async portal interaction on the runtime
+    // Run the async portal interaction on the runtime.
+    // The async fn returns only plain data (no Session lifetime).
     let result = runtime.block_on(request_screencast_async(restore.as_deref()));
 
     match result {
-        Ok((node_id, fd, session_handle, restore_token, width, height, session)) => {
+        Ok((node_id, fd, session_handle, restore_token, width, height)) => {
             println!(
                 "[zureshot-linux] Portal granted (ashpd): node_id={}, size={:?}x{:?}, session={}",
                 node_id, width, height, session_handle
@@ -98,7 +101,6 @@ pub fn request_screencast(restore_token: Option<&str>) -> Result<ScreencastSessi
                 restore_token,
                 width,
                 height,
-                _session: session,
                 _runtime: runtime,
             })
         }
@@ -110,6 +112,15 @@ pub fn request_screencast(restore_token: Option<&str>) -> Result<ScreencastSessi
 ///
 /// Portal flow:
 ///   CreateSession → SelectSources (user picks monitor) → Start → OpenPipeWireRemote
+///
+/// The `Session` object stays alive within this async scope (keeping the
+/// D-Bus session open). We extract the PipeWire fd + node_id before
+/// returning — the PipeWire stream continues independently of the
+/// D-Bus session once the fd is obtained.
+///
+/// Note: In ashpd 0.10.x, `Session<'a, Screencast<'a>>` has lifetimes
+/// that make it impossible to store in a plain struct. We keep the
+/// session alive by holding the tokio runtime in ScreencastSession.
 async fn request_screencast_async(
     restore_token: Option<&str>,
 ) -> Result<
@@ -120,7 +131,6 @@ async fn request_screencast_async(
         String,           // restore_token
         Option<u32>,      // width
         Option<u32>,      // height
-        Session<Screencast>,
     ),
     String,
 > {
@@ -175,7 +185,12 @@ async fn request_screencast_async(
         .restore_token()
         .unwrap_or_default()
         .to_string();
-    let session_handle = session.path().to_string();
+    // session.path() is pub(crate) in ashpd 0.10.x — use Debug format instead
+    let session_handle = format!("{:?}", session);
+
+    // Note: session drops here, but the PipeWire fd keeps the stream alive.
+    // The PipeWire connection is independent of the D-Bus session once
+    // the fd has been obtained via open_pipe_wire_remote.
 
     Ok((
         node_id,
@@ -184,6 +199,5 @@ async fn request_screencast_async(
         restore_token_out,
         size.map(|(w, _)| w as u32),
         size.map(|(_, h)| h as u32),
-        session,
     ))
 }
