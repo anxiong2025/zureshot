@@ -495,10 +495,12 @@ impl StreamOutput {
         unsafe { msg_send![super(this), init] }
     }
 
+    #[allow(dead_code)]
     pub fn frame_count(&self) -> u64 {
         self.ivars().frame_count.load(Ordering::Relaxed)
     }
 
+    #[allow(dead_code)]
     pub fn dropped_count(&self) -> u64 {
         self.ivars().dropped_count.load(Ordering::Relaxed)
     }
@@ -544,6 +546,7 @@ fn get_shareable_content() -> Result<Retained<SCShareableContent>, String> {
 
 /// Get the main display via ScreenCaptureKit.
 /// Blocks until the system returns available shareable content.
+#[allow(dead_code)]
 pub fn get_main_display() -> Result<Retained<SCDisplay>, String> {
     let content = get_shareable_content()?;
     let displays = unsafe { content.displays() };

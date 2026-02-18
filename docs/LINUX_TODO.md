@@ -273,11 +273,12 @@ image = "0.25"
 - [x] **2.10** 录制控制条（recording-bar）和 dim overlay：前端 100% 复用，无需修改
 - [ ] **2.11** 验证：区域选择 → 录制 → 暂停/恢复 → 停止 → MP4 可播放（待实机测试）
 
-### Phase 2.5：性能优化 — 榨干 Linux 硬件性能
+### Phase 2.5：性能优化 — 榨干 Linux 硬件性能 → 发布 v0.6.0-beta
 
 > 预估工时：**5-8 天**（需要 Linux 实机开发环境）
 > 目标：从 "能用" 升级到 "极致"，对标 macOS 版 ScreenCaptureKit + VideoToolbox 的性能水平
-> 前置条件：Phase 2 实机验证通过，Phase 3 基本完成
+> 前置条件：v0.5.0-beta 发布后收集反馈，拿到 Linux 实机
+> 发布策略：GitHub Release 标记为 `Pre-release`，标注 "Performance optimization beta"
 
 **当前 MVP 方案 vs 优化后对比：**
 
@@ -314,10 +315,12 @@ pipewire = "0.8"              # PipeWire 直接集成
 > ⚠️ 这些 crate 是 Linux-only 的，CI 的 Ubuntu job 需要安装对应 -dev 包。
 > macOS job 不受影响（条件编译）。
 
-### Phase 3：完善体验
+### Phase 3：完善体验 → 发布 v0.5.0-beta
 
 > 预估工时：**2-3 天**
-> 目标：生产可用的 Linux 版本
+> 目标：功能完整的 Linux 版本，以 beta 形式发布
+> 发布策略：GitHub Release 标记为 `Pre-release`，README 标注 "Linux support is experimental"
+> ⚠️ 因无 Linux 实机测试，所有 Linux 功能均为 beta 状态，待社区反馈 / 实机验证后升级为 stable
 
 - [ ] **3.1** 全局快捷键适配（Tauri global-shortcut 插件，验证 Wayland 下工作情况）
 - [ ] **3.2** 自动更新支持（Tauri updater，Linux 端验证）
@@ -326,8 +329,8 @@ pipewire = "0.8"              # PipeWire 直接集成
 - [ ] **3.5** Linux 端 UI 微调（字体渲染、窗口透明度在 Wayland/X11 下的表现）
 - [ ] **3.6** 权限引导：首次运行提示用户允许 Screen Cast 权限
 - [ ] **3.7** CI 产出 release artifacts（.deb + .AppImage + 更新 JSON）
-- [ ] **3.8** CI 配置 `TAURI_SIGNING_PRIVATE_KEY` GitHub Secret（自动更新签名，当前已跳过）
-- [ ] **3.9** README 添加 Linux 安装说明
+- [ ] **3.8** CI 配置 `TAURI_SIGNING_PRIVATE_KEY` GitHub Secret ✅ 已配置
+- [ ] **3.9** README 添加 Linux 安装说明 + beta 提示
 - [ ] **3.10** 测试矩阵：Ubuntu 24.04 GNOME (Wayland) + Ubuntu 24.04 GNOME (X11)
 
 ---
@@ -358,7 +361,8 @@ pipewire = "0.8"              # PipeWire 直接集成
 | **合计** | **~2900-3300 行新代码** | **~1230 行重构** | **15-23 天** |
 
 > 对比：macOS 版现有 Rust 代码约 3100 行。Linux 版最终约 3000+ 行新代码。
-> Phase 2.5 是可选的性能优化阶段，不影响功能发布。建议路线：Phase 2→3→发布 v0.5.0→2.5→发布 v0.6.0。
+> Phase 2.5 是可选的性能优化阶段，不影响功能发布。
+> 发布路线：Phase 2→3→**v0.5.0-beta**（Linux 首发）→实机验证→**v0.5.0**→2.5→**v0.6.0-beta**→验证→**v0.6.0**
 
 ---
 
@@ -371,14 +375,22 @@ pipewire = "0.8"              # PipeWire 直接集成
 - [ ] 系统托盘图标正常显示和交互（待实机测试）
 - [ ] 截屏功能可用（区域选择 → 截图 → 保存/复制）（待实机测试）
 
-### 完整版 (Phase 3 完成) → v0.5.0
+### Linux 首发 (Phase 3 完成) → v0.5.0-beta
 - [ ] 录屏功能完整（全屏/区域 + 音频 + 暂停/恢复）
 - [ ] 录制文件可正常播放
 - [ ] 全局快捷键可用
 - [ ] 自动更新可用
-- [ ] GNOME Wayland 和 X11 下均正常工作
+- [ ] GitHub Release 标记为 Pre-release
+- [ ] README 标注 "Linux support is experimental — feedback welcome!"
+- [ ] 产出 .deb + .AppImage 供下载
 
-### 极致性能版 (Phase 2.5 完成) → v0.6.0
+### Linux 稳定版 → v0.5.0
+- [ ] v0.5.0-beta 收到社区反馈 / 实机验证
+- [ ] 修复实机测试发现的问题
+- [ ] GNOME Wayland 和 X11 下均正常工作
+- [ ] 移除 beta 标记，升级为 Latest release
+
+### 极致性能版 (Phase 2.5 完成) → v0.6.0-beta
 - [ ] 硬件编码可用（VA-API 或 NVENC，根据用户硬件自动选择）
 - [ ] 录制时 CPU 占用 < 10%（对比 MVP 软编码 ~30-50%）
 - [ ] HEVC 输出：同画质文件体积比 H.264 减少 30%+
