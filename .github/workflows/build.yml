@@ -33,8 +33,6 @@ jobs:
 
       - name: Build Tauri app (macOS)
         run: pnpm tauri build
-        env:
-          TAURI_SIGNING_PRIVATE_KEY: ""
 
       - name: Upload macOS artifacts
         uses: actions/upload-artifact@v4
@@ -87,8 +85,6 @@ jobs:
 
       - name: Build Tauri app (Linux)
         run: pnpm tauri build
-        env:
-          TAURI_SIGNING_PRIVATE_KEY: ""
 
       - name: Upload Linux artifacts
         uses: actions/upload-artifact@v4
