@@ -111,28 +111,14 @@ fn set_auto_update_enabled(app: &AppHandle, enabled: bool) {
     let _ = std::fs::write(&path, serde_json::to_string_pretty(&settings).unwrap());
 }
 
-// ── Native macOS dialogs ─────────────────────────────────────────────
+// ── Native dialogs (delegated to platform layer) ────────────────────
 
 fn show_confirm_dialog(title: &str, message: &str, accept: &str, cancel: &str) -> bool {
-    let script = format!(
-        "display dialog \"{}\" buttons {{\"{}\" , \"{}\"}} default button \"{}\" with title \"{}\"",
-        message, cancel, accept, accept, title
-    );
-    std::process::Command::new("osascript")
-        .args(["-e", &script])
-        .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).contains(accept))
-        .unwrap_or(false)
+    crate::platform::imp::show_confirm_dialog(title, message, accept, cancel)
 }
 
 fn show_info_dialog(title: &str, message: &str) {
-    let script = format!(
-        "display dialog \"{}\" buttons {{\"OK\"}} default button \"OK\" with title \"{}\"",
-        message, title
-    );
-    let _ = std::process::Command::new("osascript")
-        .args(["-e", &script])
-        .output();
+    crate::platform::imp::show_info_dialog(title, message);
 }
 
 // ── Tray menu ────────────────────────────────────────────────────────
@@ -401,7 +387,7 @@ fn handle_menu_event(app: &AppHandle, id: &str) {
                 .unwrap_or_else(|| std::path::PathBuf::from("."));
             let zureshot_dir = base.join("Zureshot");
             let _ = std::fs::create_dir_all(&zureshot_dir);
-            let _ = std::process::Command::new("open").arg(&zureshot_dir).spawn();
+            let _ = crate::platform::imp::open_folder(&zureshot_dir.to_string_lossy());
         }
         "check_update" => {
             let app = app.clone();

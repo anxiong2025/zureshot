@@ -42,6 +42,21 @@
       "signingIdentity": "-",
       "minimumSystemVersion": "12.3"
     },
+    "linux": {
+      "deb": {
+        "depends": [
+          "libwebkit2gtk-4.1-0",
+          "libappindicator3-1",
+          "xdg-desktop-portal",
+          "zenity"
+        ],
+        "section": "utils",
+        "desktopTemplate": null
+      },
+      "appimage": {
+        "bundleMediaFramework": true
+      }
+    },
     "resources": [
       "icons/tray.png",
       "icons/tray-recording.png"

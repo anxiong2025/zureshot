@@ -33,7 +33,7 @@ use objc2_av_foundation::{
 };
 use objc2_foundation::{NSError, NSString, NSNumber};
 
-use crate::capture::RecordingQuality;
+use crate::platform::RecordingQuality;
 
 /// Audio encoding settings for AAC in MP4.
 const AUDIO_SAMPLE_RATE: f64 = 48000.0;

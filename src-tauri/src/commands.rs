@@ -2,35 +2,16 @@
 //!
 //! These functions are exposed to the frontend via Tauri's IPC mechanism.
 
-use crate::capture;
-use crate::capture::RecordingQuality;
-use crate::writer;
-use objc2::rc::Retained;
-use objc2_av_foundation::{AVAssetWriter, AVAssetWriterInput};
-use objc2_core_foundation::{CGPoint, CGRect, CGSize};
-use objc2_screen_capture_kit::SCStream;
+use crate::platform;
+use crate::platform::{CaptureRegion, RecordingQuality, StartRecordingConfig};
 use serde::{Deserialize, Serialize};
 use std::sync::Mutex;
 use tauri::{AppHandle, Emitter, Manager, WebviewWindowBuilder, WebviewUrl};
 
-/// Region definition for region-based recording (web coordinates: top-left origin, CSS pixels)
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct CaptureRegion {
-    pub x: f64,
-    pub y: f64,
-    pub width: f64,
-    pub height: f64,
-}
-
 /// Recording state shared across commands
 pub struct RecordingState {
-    pub stream: Option<Retained<SCStream>>,
-    pub writer: Option<Retained<AVAssetWriter>>,
-    pub input: Option<Retained<AVAssetWriterInput>>,
-    /// System audio writer input (AAC track)
-    pub audio_input: Option<Retained<AVAssetWriterInput>>,
-    /// Microphone writer input (AAC track)
-    pub mic_input: Option<Retained<AVAssetWriterInput>>,
+    /// Platform-specific recording handle (owns stream, encoder, etc.)
+    pub handle: Option<platform::imp::RecordingHandle>,
     pub output_path: Option<String>,
     pub is_recording: bool,
     pub is_paused: bool,
@@ -43,18 +24,12 @@ pub struct RecordingState {
     pub quality: RecordingQuality,
     /// Output format: "video" (MP4) or "gif" (record MP4, convert to GIF on stop)
     pub output_format: String,
-    /// Shared paused flag read by the capture delegate (AtomicBool behind Arc)
-    pub paused_flag: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
 impl Default for RecordingState {
     fn default() -> Self {
         Self {
-            stream: None,
-            writer: None,
-            input: None,
-            audio_input: None,
-            mic_input: None,
+            handle: None,
             output_path: None,
             is_recording: false,
             is_paused: false,
@@ -64,12 +39,11 @@ impl Default for RecordingState {
             region: None,
             quality: RecordingQuality::Standard,
             output_format: "video".to_string(),
-            paused_flag: None,
         }
     }
 }
 
-// SAFETY: RecordingState contains Objective-C objects that are thread-safe.
+// SAFETY: RecordingState contains platform-specific objects that are thread-safe.
 // We wrap it in a Mutex for interior mutability.
 unsafe impl Send for RecordingState {}
 unsafe impl Sync for RecordingState {}
@@ -107,17 +81,6 @@ pub struct RecordingStartedPayload {
     pub max_duration: f64,
 }
 
-/// Catch ObjC exceptions for a simple void call.
-fn catch_objc_cmd(context: &str, f: impl FnOnce()) {
-    use std::panic::AssertUnwindSafe;
-    if let Err(e) = objc2::exception::catch(AssertUnwindSafe(f)) {
-        let desc = e
-            .map(|ex| format!("{ex}"))
-            .unwrap_or_else(|| "unknown ObjC exception".into());
-        eprintln!("[zureshot] ObjC exception in {}: {}", context, desc);
-    }
-}
-
 /// Core logic to start recording (called from both tray and commands)
 pub fn do_start_recording(
     app: &AppHandle,
@@ -149,137 +112,20 @@ pub fn do_start_recording(
             .to_string()
     });
 
-    // Remove existing file (AVAssetWriter won't overwrite)
-    let _ = std::fs::remove_file(&path);
-
     println!("[zureshot] Starting recording to: {}", path);
 
-    // Get display and windows for potential exclusion
-    let (display, all_windows) = capture::get_display_and_windows().map_err(|e| {
-        eprintln!("[zureshot] {}", e);
-        e
-    })?;
-    let (phys_width, phys_height, retina_scale) = capture::display_physical_size(&display);
-    println!("[zureshot] Display: {}x{} physical, scale={}", phys_width, phys_height, retina_scale);
-
-    // Determine output dimensions and source rect
-    let (width, height, source_rect) = if let Some(ref rgn) = region {
-        // Use Retina scale to convert CSS/logical pixels → physical pixels.
-        // Region coordinates from the web UI are in logical (CSS) points.
-        // Output dimensions must be in physical pixels for pixel-perfect sharpness.
-        let pixel_w = (rgn.width * retina_scale) as usize;
-        let pixel_h = (rgn.height * retina_scale) as usize;
-        // Ensure even dimensions for HEVC
-        let pixel_w = if pixel_w % 2 != 0 { pixel_w + 1 } else { pixel_w };
-        let pixel_h = if pixel_h % 2 != 0 { pixel_h + 1 } else { pixel_h };
-
-        // ScreenCaptureKit sourceRect uses logical points (top-left origin),
-        // same as CSS coordinates. No coordinate conversion needed.
-        let rect = CGRect::new(
-            CGPoint::new(rgn.x, rgn.y),
-            CGSize::new(rgn.width, rgn.height),
-        );
-        println!(
-            "[zureshot] Region: css({},{} {}x{}) → pixels({}x{}) scale={} quality={:?}",
-            rgn.x, rgn.y, rgn.width, rgn.height,
-            pixel_w, pixel_h, retina_scale, quality
-        );
-        (pixel_w, pixel_h, Some(rect))
-    } else {
-        // Full screen: native Retina physical pixels for both Standard and High.
-        // Standard vs High only differs in frame rate (30 vs 60 fps).
-        println!("[zureshot] Full screen: {}x{} (physical, {}x Retina) quality={:?}", phys_width, phys_height, retina_scale, quality);
-        (phys_width, phys_height, None)
-    };
-
-    // Collect windows to exclude (our own app windows)
-    let exclude_windows = collect_app_windows_to_exclude(app, &all_windows);
-
-    // Create H.264 writer
-    let (writer, input) = writer::create_writer(&path, width, height, quality).map_err(|e| {
-        eprintln!("[zureshot] {}", e);
-        e
-    })?;
-
-    // Create audio writer inputs if audio capture is requested
-    let audio_input = if capture_system_audio {
-        let ai = writer::create_audio_input("system-audio").map_err(|e| {
-            eprintln!("[zureshot] {}", e);
-            e
-        })?;
-        // Verify writer can accept this input before adding
-        let can_add: bool = unsafe { objc2::msg_send![&*writer, canAddInput: &*ai] };
-        if can_add {
-            catch_objc_cmd("addInput(audio)", || unsafe {
-                writer.addInput(&ai);
-            });
-            println!("[zureshot] System audio track added to writer");
-            Some(ai)
-        } else {
-            eprintln!("[zureshot] WARNING: Writer cannot add system audio input — audio will not be recorded");
-            None
-        }
-    } else {
-        None
-    };
-
-    let mic_input = if capture_microphone {
-        let mi = writer::create_audio_input("microphone").map_err(|e| {
-            eprintln!("[zureshot] {}", e);
-            e
-        })?;
-        let can_add: bool = unsafe { objc2::msg_send![&*writer, canAddInput: &*mi] };
-        if can_add {
-            catch_objc_cmd("addInput(mic)", || unsafe {
-                writer.addInput(&mi);
-            });
-            println!("[zureshot] Microphone track added to writer");
-            Some(mi)
-        } else {
-            eprintln!("[zureshot] WARNING: Writer cannot add microphone input — mic will not be recorded");
-            None
-        }
-    } else {
-        None
-    };
-
-    // Start writing AFTER all inputs are added.
-    // AVAssetWriter does not allow adding inputs after startWriting().
-    writer::start_writing(&writer).map_err(|e| {
-        eprintln!("[zureshot] {}", e);
-        e
-    })?;
-
-    // Shared paused flag — the capture delegate checks this on every frame
-    let paused_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-
-    // Start capture
-    let stream = capture::create_and_start(
-        &display,
-        width,
-        height,
-        writer.clone(),
-        input.clone(),
-        audio_input.clone(),
-        mic_input.clone(),
-        source_rect,
-        exclude_windows,
+    // Delegate all platform-specific setup to the platform layer
+    let config = StartRecordingConfig {
+        output_path: path.clone(),
+        region: region.clone(),
         quality,
-        paused_flag.clone(),
         capture_system_audio,
         capture_microphone,
-    )
-    .map_err(|e| {
-        eprintln!("[zureshot] {}", e);
-        e
-    })?;
+    };
+    let handle = platform::imp::start_recording(app, config)?;
 
     // Update state
-    recording.stream = Some(stream);
-    recording.writer = Some(writer);
-    recording.input = Some(input);
-    recording.audio_input = audio_input;
-    recording.mic_input = mic_input;
+    recording.handle = Some(handle);
     recording.output_path = Some(path.clone());
     recording.is_recording = true;
     recording.is_paused = false;
@@ -289,15 +135,6 @@ pub fn do_start_recording(
     recording.region = region.clone();
     recording.quality = quality;
     recording.output_format = output_format.unwrap_or_else(|| "video".to_string());
-    recording.paused_flag = Some(paused_flag);
-
-    println!(
-        "[zureshot] Recording started! systemAudio={}, mic={}, audioInput={}, micInput={}",
-        capture_system_audio,
-        capture_microphone,
-        recording.audio_input.is_some(),
-        recording.mic_input.is_some()
-    );
 
     // Switch tray icon to recording state (red dot + Stop enabled)
     crate::tray::notify_recording_started(app);
@@ -316,48 +153,11 @@ pub fn do_start_recording(
     Ok(path)
 }
 
-/// Collect SCWindow objects that belong to our app (for exclusion from capture).
-/// Matches by the app's process ID.
-fn collect_app_windows_to_exclude(
-    app: &AppHandle,
-    all_windows: &[Retained<objc2_screen_capture_kit::SCWindow>],
-) -> Vec<Retained<objc2_screen_capture_kit::SCWindow>> {
-    let our_pid = std::process::id() as i32;
-
-    // Collect window labels we own in Tauri
-    let our_labels: Vec<String> = app
-        .webview_windows()
-        .keys()
-        .cloned()
-        .collect();
-    println!(
-        "[zureshot] Excluding windows for PID {} (Tauri windows: {:?})",
-        our_pid, our_labels
-    );
-
-    let mut excluded = Vec::new();
-    for w in all_windows {
-        let pid = unsafe { w.owningApplication() }
-            .map(|app_ref| unsafe { app_ref.processID() })
-            .unwrap_or(-1);
-        if pid == our_pid {
-            let title = unsafe { w.title() }
-                .map(|t| t.to_string())
-                .unwrap_or_default();
-            println!("[zureshot] Excluding window: PID={} title={:?}", pid, title);
-            excluded.push(w.clone());
-        }
-    }
-    excluded
-}
-
 /// Core logic to stop recording (called from both tray and commands)
 pub fn do_stop_recording(app: &AppHandle) -> Result<RecordingResult, String> {
     // Extract all recording state while holding the mutex, then release it
-    // BEFORE any blocking operations. Holding the mutex during GCD completion
-    // handler waits can deadlock if the handler needs the main thread (which
-    // Tauri sync commands also block on).
-    let (stream, writer, input, audio_input, mic_input, output_path, duration, output_format) = {
+    // BEFORE any blocking operations.
+    let (handle, output_path, duration, output_format) = {
         let state: tauri::State<'_, Mutex<RecordingState>> = app.state();
         let mut recording = state.lock().map_err(|e: std::sync::PoisonError<_>| e.to_string())?;
 
@@ -375,13 +175,7 @@ pub fn do_stop_recording(app: &AppHandle) -> Result<RecordingResult, String> {
             })
             .unwrap_or(0.0);
 
-        // Take values out — resets state and releases the ObjC references
-        // from RecordingState (the locals now own them).
-        let stream = recording.stream.take();
-        let writer = recording.writer.take();
-        let input = recording.input.take();
-        let audio_input = recording.audio_input.take();
-        let mic_input = recording.mic_input.take();
+        let handle = recording.handle.take();
         let output_path = recording.output_path.take().unwrap_or_default();
         let output_format = std::mem::replace(&mut recording.output_format, "video".to_string());
         recording.is_recording = false;
@@ -391,9 +185,8 @@ pub fn do_stop_recording(app: &AppHandle) -> Result<RecordingResult, String> {
         recording.pause_start = None;
         recording.region = None;
         recording.quality = RecordingQuality::Standard;
-        recording.paused_flag = None;
 
-        (stream, writer, input, audio_input, mic_input, output_path, duration, output_format)
+        (handle, output_path, duration, output_format)
     }; // ← mutex released here
 
     println!("[zureshot] Stopping recording after {:.1}s", duration);
@@ -406,25 +199,17 @@ pub fn do_stop_recording(app: &AppHandle) -> Result<RecordingResult, String> {
         let _ = win.destroy();
     }
 
-    // Stop capture — blocks until SCStream confirms stop (no mutex held)
-    if let Some(ref stream) = stream {
-        println!("[zureshot] Stopping capture stream...");
-        capture::stop(stream);
-        println!("[zureshot] Capture stream stopped");
+    // Stop capture and finalize file (platform-specific)
+    if let Some(ref handle) = handle {
+        handle.stop_capture();
     }
 
-    // Brief pause to let the capture dispatch queue fully drain
+    // Brief pause to let the capture pipeline fully drain
     std::thread::sleep(std::time::Duration::from_millis(200));
 
-    // Finalize MP4 — writes the moov atom (no mutex held)
-    if let (Some(ref writer), Some(ref input)) = (&writer, &input) {
-        println!("[zureshot] Finalizing MP4...");
-        writer::finalize(
-            writer,
-            input,
-            audio_input.as_deref(),
-            mic_input.as_deref(),
-        );
+    // Finalize output file
+    if let Some(ref handle) = handle {
+        handle.finalize();
     }
 
     // If format is GIF, convert MP4 → GIF using ffmpeg with palette optimization
@@ -560,17 +345,10 @@ pub fn get_recording_status(
     })
 }
 
-/// Open the recorded file in Finder
+/// Open the recorded file in the system file manager
 #[tauri::command]
 pub async fn reveal_in_finder(path: String) -> Result<(), String> {
-    #[cfg(target_os = "macos")]
-    {
-        std::process::Command::new("open")
-            .args(["-R", &path])
-            .spawn()
-            .map_err(|e| e.to_string())?;
-    }
-    Ok(())
+    platform::imp::reveal_file(&path)
 }
 
 /// Get the default recordings directory
@@ -748,8 +526,8 @@ pub fn pause_recording(
     }
 
     // Set the atomic flag so the capture delegate drops frames
-    if let Some(ref flag) = recording.paused_flag {
-        flag.store(true, std::sync::atomic::Ordering::Relaxed);
+    if let Some(ref handle) = recording.handle {
+        handle.pause();
     }
 
     recording.is_paused = true;
@@ -773,8 +551,8 @@ pub fn resume_recording(
     }
 
     // Clear the atomic flag so frames start being written again
-    if let Some(ref flag) = recording.paused_flag {
-        flag.store(false, std::sync::atomic::Ordering::Relaxed);
+    if let Some(ref handle) = recording.handle {
+        handle.resume();
     }
 
     // Accumulate this pause duration
@@ -928,28 +706,16 @@ pub fn do_open_recording_overlay(app: &AppHandle, region: &CaptureRegion) -> Res
     Ok(())
 }
 
-/// Refresh the SCStream content filter to exclude all windows belonging to our PID.
-/// Called after creating new windows (recording bar, dim overlay) so they don't
-/// appear in the captured video.
+/// Refresh the stream content filter to exclude our app windows from capture.
+/// Each platform handles this differently (macOS: SCStream filter, Linux: no-op).
 pub fn refresh_stream_exclusion(app: &AppHandle) -> Result<(), String> {
-    // Clone the stream handle while holding the lock briefly
-    let stream = {
-        let state: tauri::State<'_, Mutex<RecordingState>> = app.state();
-        let recording = state.lock().map_err(|e| e.to_string())?;
-        recording
-            .stream
-            .as_ref()
-            .cloned()
-            .ok_or("No active stream to update")?
-    };
-
-    // Get fresh window list (no mutex held — avoids deadlock)
-    let (display, all_windows) = capture::get_display_and_windows()
-        .map_err(|e| format!("Failed to get windows for exclusion refresh: {}", e))?;
-
-    let exclude_windows = collect_app_windows_to_exclude(app, &all_windows);
-
-    capture::update_stream_filter(&stream, &display, exclude_windows)
+    let state: tauri::State<'_, Mutex<RecordingState>> = app.state();
+    let recording = state.lock().map_err(|e| e.to_string())?;
+    if let Some(ref handle) = recording.handle {
+        handle.refresh_exclusion(app)
+    } else {
+        Err("No active recording to update".into())
+    }
 }
 
 // ════════════════════════════════════════════════════════════════════════
@@ -1054,7 +820,7 @@ pub async fn take_screenshot(
         .to_string();
 
     // Capture
-    let (img_w, img_h, file_size) = capture::take_screenshot_region(x, y, width, height, &temp_path)?;
+    let (img_w, img_h, file_size) = platform::imp::take_screenshot_region(x, y, width, height, &temp_path)?;
 
     // Read file and encode as base64 for preview
     let file_bytes = std::fs::read(&temp_path)
@@ -1122,24 +888,7 @@ pub async fn copy_screenshot(path: String) -> Result<(), String> {
         return Err("Screenshot file not found".into());
     }
 
-    // Use NSPasteboard to copy the image to clipboard (macOS)
-    #[cfg(target_os = "macos")]
-    {
-        // Use osascript to set clipboard to the image file — simple & reliable
-        let script = format!(
-            "set the clipboard to (read (POSIX file \"{}\") as «class PNGf»)",
-            path
-        );
-        let output = std::process::Command::new("osascript")
-            .args(["-e", &script])
-            .output()
-            .map_err(|e| format!("Failed to run osascript: {}", e))?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(format!("Failed to copy to clipboard: {}", stderr));
-        }
-    }
+    platform::imp::copy_image_to_clipboard(&path)?;
 
     // Clean up temp file after copying
     let _ = std::fs::remove_file(&path);

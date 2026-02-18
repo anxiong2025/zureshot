@@ -2,10 +2,9 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 #![allow(non_snake_case)]
 
-mod capture;
 mod commands;
+mod platform;
 mod tray;
-mod writer;
 
 use commands::RecordingState;
 use std::sync::Mutex;

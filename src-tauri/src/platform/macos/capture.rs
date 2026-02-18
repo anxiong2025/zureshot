@@ -25,7 +25,6 @@ use objc2_screen_capture_kit::{
 };
 use objc2_core_graphics::kCGColorSpaceSRGB;
 use objc2_core_media::CMTime;
-use serde::{Deserialize, Serialize};
 
 // ── Screenshot support ────────────────────────────────────────────────
 
@@ -157,29 +156,7 @@ pub fn take_screenshot_region(
     Ok((img_width, img_height, file_size))
 }
 
-/// Recording quality presets.
-///
-/// Both modes capture at native Retina resolution for maximum sharpness.
-/// HEVC (H.265) hardware encoding keeps file sizes small.
-///
-/// Memory usage (2880×1800 Retina display, NV12 format):
-///   Standard: native 2880×1800 @ 30fps → ~7.4 MB/frame × 3 queue = ~22 MB buffers
-///   High:     native 2880×1800 @ 60fps → ~7.4 MB/frame × 3 queue = ~22 MB buffers
-///
-/// File size (HEVC, 60s recording at 2880×1800):
-///   Standard (30fps, 8 Mbps):  ~30-40 MB/min
-///   High (60fps, 14 Mbps):     ~50-70 MB/min
-///   CleanShot X (H.264):       ~75-110 MB/min
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, Default, PartialEq)]
-pub enum RecordingQuality {
-    /// Standard: native Retina resolution, 30 fps, HEVC.
-    /// Sharp text, smooth enough for most content. Best file size.
-    #[default]
-    Standard,
-    /// High: native Retina resolution, 60 fps, HEVC.
-    /// Butter-smooth scrolling and animations. Premium quality.
-    High,
-}
+use crate::platform::RecordingQuality;
 
 // ────────────────────────────────────────────────────────────────
 //  StreamOutput — SCStreamOutput delegate (receives raw frames)

@@ -1,7 +1,7 @@
 [package]
 name = "zureshot"
 version = "0.4.3"
-description = "CleanShot X-style screen recorder for macOS"
+description = "Screen capture and recording tool"
 authors = ["robert"]
 edition = "2021"
 
@@ -23,7 +23,11 @@ dirs = "5"
 base64 = "0.22"
 tokio = { version = "1", features = ["rt"] }
 
-# macOS screen capture dependencies
+[target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
+tauri-plugin-global-shortcut = "2"
+
+# ── macOS screen capture dependencies ─────────────────────────────────
+[target.'cfg(target_os = "macos")'.dependencies]
 objc2 = { version = "0.6", features = ["exception"] }
 objc2-foundation = "0.3"
 objc2-screen-capture-kit = "0.3"
@@ -35,8 +39,13 @@ objc2-core-foundation = "0.3"
 block2 = "0.6"
 dispatch2 = "0.3"
 
-[target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
-tauri-plugin-global-shortcut = "2"
+# ── Linux dependencies (Phase 2: uncomment when implementing recording) ──
+# [target.'cfg(target_os = "linux")'.dependencies]
+# zbus = "4"
+# gstreamer = "0.23"
+# gstreamer-app = "0.23"
+# gstreamer-video = "0.23"
+# image = "0.25"
 
 [features]
 default = ["custom-protocol"]
