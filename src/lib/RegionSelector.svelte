@@ -212,15 +212,20 @@
         selY = 0;
         selW = window.innerWidth;
         selH = window.innerHeight;
-        phase = 'adjusting';
+      } else {
+        selX = finalRect.x;
+        selY = finalRect.y;
+        selW = finalRect.width;
+        selH = finalRect.height;
+      }
+
+      // Screenshot mode: capture immediately on mouse release
+      if (isScreenshot) {
+        confirmSelection('screenshot');
         return;
       }
 
-      // Commit to adjusting phase
-      selX = finalRect.x;
-      selY = finalRect.y;
-      selW = finalRect.width;
-      selH = finalRect.height;
+      // Record mode: enter adjusting phase for toolbar
       phase = 'adjusting';
     } else if (dragType) {
       dragType = null;
@@ -410,7 +415,7 @@
         cancel();
       }
     } else if (e.key === 'Enter' && phase === 'adjusting') {
-      confirmSelection(isScreenshot ? 'screenshot' : 'video');
+      confirmSelection('video');
     }
   }
 </script>
@@ -533,19 +538,8 @@
           </button>
         </div>
 
-        <!-- Row 2: Audio toggles + Record button (record mode) or Screenshot button -->
-        {#if isScreenshot}
-        <div class="toolbar-row toolbar-bottom">
-          <!-- Screenshot capture button -->
-          <button class="btn-screenshot" onclick={() => confirmSelection('screenshot')}>
-            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-              <path d="M23 19a2 2 0 01-2 2H3a2 2 0 01-2-2V8a2 2 0 012-2h4l2-3h6l2 3h4a2 2 0 012 2z"/>
-              <circle cx="12" cy="13" r="4"/>
-            </svg>
-            Capture
-          </button>
-        </div>
-        {:else}
+        <!-- Row 2: Audio toggles + Record button (record mode only) -->
+        {#if !isScreenshot}
         <!-- Row 2: Audio toggles + Record button -->
         <div class="toolbar-row toolbar-bottom">
           <!-- Microphone toggle -->
@@ -653,7 +647,7 @@
   {#if phase === 'idle'}
     <div class="instructions">
       {#if isScreenshot}
-        Click and drag to select region · Click for fullscreen screenshot<br />
+        Click and drag to capture region · Click for fullscreen screenshot<br />
       {:else}
         Click and drag to select region · Click to record fullscreen<br />
       {/if}
@@ -663,11 +657,7 @@
 
   {#if phase === 'adjusting'}
     <div class="instructions-bottom">
-      {#if isScreenshot}
-        Drag to move · Handles to resize · <b>Enter</b> to capture · <b>Esc</b> to reset
-      {:else}
-        Drag to move · Handles to resize · <b>Enter</b> to record video · <b>Esc</b> to reset
-      {/if}
+      Drag to move · Handles to resize · <b>Enter</b> to record video · <b>Esc</b> to reset
     </div>
   {/if}
 </div>
