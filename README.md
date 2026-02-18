@@ -18,7 +18,7 @@
 </p>
 
 <p align="center">
-  <a href="README.md">English</a> · <a href="README.zh-CN.md">简体中文</a>
+  <a href="README.md">English</a> · <a href="README.zh-CN.md">简体中文</a> · <a href="#wechat">💬 WeChat</a>
 </p>
 
 ---
@@ -122,30 +122,33 @@ A 60-second Retina recording at 60fps: **~135 MB** (vs 200+ MB with H.264).
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
-│                         Zureshot                                    │
+│                           Zureshot                                  │
 ├─────────────────┬───────────────────────────────────────────────────┤
 │   UI Layer      │              Engine (Rust)                        │
 │   Svelte 5      │                                                   │
-│                 │  ┌──────────────────────────────────────────────┐ │
-│  Tray Menu      │  │           Capture Pipeline                   │ │
+│   (100% shared) │  ┌──────────────────────────────────────────────┐ │
+│                 │  │         Platform Abstraction                 │ │
+│  Tray Menu      │  │        platform/mod.rs                       │ │
 │  Region Select  │  │                                              │ │
-│  Recording Bar  │  │  SCK ──→ IOSurface ──→ VideoToolbox ──→ MP4  │ │
-│  Dim Overlay    │  │  (GPU)    (GPU/VRAM)    (Media Engine)  (SSD) │ │
-│                 │  │                                              │ │
-│                 │  │  Audio: SCK ──→ CMSampleBuffer ──→ AAC ──┘   │ │
+│  Recording Bar  │  │  ┌─── macOS ────┐   ┌──── Linux ────────┐   │ │
+│  Dim Overlay    │  │  │ SCK→IOSurf→  │   │ XDG Portal→       │   │ │
+│  Screenshot     │  │  │ VideoToolbox │   │ PipeWire→GStreamer │   │ │
+│  Preview        │  │  │ →HEVC→MP4    │   │ →x264→MP4          │   │ │
+│                 │  │  └──────────────┘   └────────────────────┘   │ │
 │                 │  └──────────────────────────────────────────────┘ │
 │                 │                                                   │
-│                 │  ┌─────────┐ ┌──────────┐ ┌───────────────────┐  │
-│                 │  │ capture │ │  writer  │ │    commands       │  │
-│                 │  │   .rs   │ │   .rs    │ │      .rs          │  │
-│                 │  │ SCK API │ │ AVAsset  │ │ Tauri IPC bridge  │  │
-│                 │  │ Delegate│ │ Writer   │ │ State management  │  │
-│                 │  └─────────┘ └──────────┘ └───────────────────┘  │
+│                 │  ┌──────────┐ ┌──────────┐ ┌────────────────┐    │
+│                 │  │ commands │ │   tray   │ │     lib        │    │
+│                 │  │   .rs    │ │   .rs    │ │     .rs        │    │
+│                 │  │ IPC cmds │ │ menus    │ │ bootstrap      │    │
+│                 │  └──────────┘ └──────────┘ └────────────────┘    │
 ├─────────────────┴───────────────────────────────────────────────────┤
-│                    Tauri v2 + objc2 FFI                             │
-├─────────────────────────────────────────────────────────────────────┤
-│  macOS: ScreenCaptureKit │ VideoToolbox │ AVFoundation │ CoreMedia  │
-└─────────────────────────────────────────────────────────────────────┘
+│                         Tauri v2                                    │
+├──────────────────────────────┬──────────────────────────────────────┤
+│  macOS: ScreenCaptureKit     │  Linux: XDG Portal + GStreamer      │
+│  VideoToolbox + AVFoundation │  PipeWire + x264 + ffmpeg           │
+│  objc2 FFI                   │  Subprocess pipeline (zero crates)  │
+└──────────────────────────────┴──────────────────────────────────────┘
 ```
 
 ### Data Flow — Zero-Copy Path
@@ -179,31 +182,64 @@ A 60-second Retina recording at 60fps: **~135 MB** (vs 200+ MB with H.264).
 
 **Key insight**: The pixel data (e.g., 3200×2132 × 1.5 bytes/pixel = ~10 MB/frame) stays entirely in unified GPU memory. Only the tiny compressed NALUs (~50-100 KB/frame) pass through CPU memory on the way to disk.
 
+### Data Flow — Linux (GStreamer Pipeline)
+
+```
+  User clicks Record
+        │
+        ▼
+  XDG Desktop Portal (D-Bus)
+    └─ CreateSession → SelectSources → Start
+    └─ User confirms screen/window in system dialog
+    └─ Returns PipeWire node_id
+        │
+        ▼
+  gst-launch-1.0 subprocess
+    └─ pipewiresrc (captures PipeWire stream)
+    └─ videoconvert → videoscale → videocrop
+    └─ x264enc (H.264 software encoding)
+    └─ mp4mux → filesink (MP4 output)
+    └─ (optional) pulsesrc → audioconvert → faac
+        │
+        ▼
+  Pause: SIGINT → EOS → save segment
+  Resume: new gst-launch process → new segment
+  Stop: ffmpeg concat → final MP4
+```
+
+> **Note**: Linux currently uses software H.264 encoding. Hardware-accelerated encoding (VA-API/NVENC, HEVC) is planned for v0.6.0.
+
 ### Source Files
 
 | File | Lines | Responsibility |
 |------|-------|----------------|
-| `capture.rs` | ~650 | SCK stream setup, SCStreamOutput delegate, frame routing, PTS enforcement |
-| `writer.rs` | ~470 | AVAssetWriter creation, HEVC encoding settings, BT.709 color, finalization |
-| `commands.rs` | ~820 | Tauri IPC commands, recording state machine, window management |
-| `tray.rs` | ~250 | System tray icon, context menu, shortcut handling |
-| `lib.rs` | ~60 | App bootstrap, plugin registration |
+| `platform/mod.rs` | ~56 | Platform abstraction: shared types, conditional compilation |
+| `platform/macos/mod.rs` | ~340 | macOS RecordingHandle, lifecycle, system integration |
+| `platform/macos/capture.rs` | ~650 | SCK stream, SCStreamOutput delegate, frame routing, PTS |
+| `platform/macos/writer.rs` | ~470 | AVAssetWriter, HEVC encoding, BT.709, finalization |
+| `platform/linux/mod.rs` | ~430 | Linux RecordingHandle, lifecycle, system integration |
+| `platform/linux/portal.rs` | ~315 | XDG Desktop Portal ScreenCast (D-Bus via Python) |
+| `platform/linux/writer.rs` | ~360 | GStreamer pipeline management (gst-launch subprocess) |
+| `platform/linux/capture.rs` | ~90 | Screenshot (gnome-screenshot / grim) |
+| `commands.rs` | ~940 | Tauri IPC commands, recording state machine, window management |
+| `tray.rs` | ~520 | System tray, menus, autostart, update check |
+| `lib.rs` | ~70 | App bootstrap, plugin registration |
 
 **Rust** handles all capture, encoding, and file I/O. The UI is a thin Svelte layer (~5 components) for tray menus, region selection, and recording controls. Tauri v2 bridges the two with type-safe IPC.
 
 ### Tech Stack
 
-| Layer | Technology | Why |
-|-------|-----------|-----|
-| Capture | ScreenCaptureKit (macOS 12.3+) | Next-gen capture API, GPU-native IOSurface output |
-| Pixel Format | NV12 (`420v`) | Native format for HEVC encoder — zero color conversion |
-| Color Space | sRGB capture → BT.709 encoding | Lossless metadata match, no implicit conversion |
-| Encoding | VideoToolbox HEVC Main | Apple Media Engine hardware, ~3% CPU |
-| Container | AVAssetWriter → MP4 | Native Apple muxer, proper moov atom, instant seek |
-| Audio | AAC 48kHz stereo, 128kbps | System audio + microphone, dual track |
-| FFI | objc2 0.6 + block2 0.6 | Type-safe Rust ↔ Objective-C bridge |
-| App Shell | Tauri v2 | Lightweight native wrapper, ~3 MB binary |
-| Frontend | Svelte 5 + Vite | Minimal UI for overlays and controls |
+| Layer | macOS | Linux |
+|-------|-------|-------|
+| Capture | ScreenCaptureKit (GPU zero-copy) | XDG Desktop Portal + PipeWire |
+| Encoding | VideoToolbox HEVC (hardware) | x264 H.264 (software, VA-API planned) |
+| Container | AVAssetWriter → MP4 | GStreamer mp4mux → MP4 |
+| Audio | ScreenCaptureKit AAC | PulseAudio + GStreamer AAC |
+| Screenshots | CGWindowListCreateImage | gnome-screenshot / grim |
+| FFI | objc2 0.6 + block2 0.6 | Subprocess (zero native crates) |
+| Dialogs | osascript (AppleScript) | zenity / kdialog |
+| App Shell | Tauri v2 | Tauri v2 |
+| Frontend | Svelte 5 + Vite (100% shared) | Svelte 5 + Vite (100% shared) |
 
 ---
 
@@ -318,50 +354,68 @@ pnpm tauri build
 
 ## 🗺 Roadmap
 
-### v0.2 — Trim & Export
+### ✅ v0.4 — Current Release
+- [x] Full screen & region recording (macOS: HEVC zero-copy)
+- [x] Pause / Resume
+- [x] System audio + microphone capture
+- [x] GIF export (palette-optimized, max 30fps)
+- [x] Screenshot mode (full screen / region) with preview
+- [x] Copy to clipboard
+- [x] Recording countdown timer (3-2-1)
+- [x] Thumbnail preview on recording stop
+- [x] Quality presets (Standard 30fps / High 60fps)
+- [x] Auto-update with Tauri updater
+
+### 🚧 v0.5.0-beta — Linux Support (Current)
+- [x] Platform abstraction layer (macOS + Linux in one codebase)
+- [x] Linux screen recording (XDG Portal + GStreamer + PipeWire)
+- [x] Linux screenshots (gnome-screenshot / grim)
+- [x] Linux system integration (zenity dialogs, xdg-open, autostart)
+- [x] CI/CD: macOS + Ubuntu dual-platform build & release
+- [ ] Real-device verification on Ubuntu 24.04
+
+### 🔮 v0.6.0-beta — Linux Performance Optimization
+- [ ] Pure Rust D-Bus (zbus crate, remove Python dependency)
+- [ ] In-process GStreamer pipeline (gstreamer-rs crate)
+- [ ] Hardware encoding: VA-API (Intel/AMD) / NVENC (NVIDIA)
+- [ ] HEVC (H.265) output on Linux
+- [ ] Seamless pause/resume (GstPipeline state switch, no segment concat)
+
+### v0.7 — Trim & Export
 - [ ] Post-recording preview window
 - [ ] Drag-to-trim: start/end range slider
 - [ ] Stream copy export (no re-encoding, instant)
-- [ ] Optional hardware-accelerated 4K → 1080p transcode
-
-### v0.3 — Polish & Quality of Life
-- [ ] Multi-display selection
-- [ ] Thumbnail preview on recording stop
-- [ ] Global settings panel (output path, format, quality)
-- [ ] Auto-open in Finder after export
-- [ ] Recording countdown timer (3-2-1)
-
-### v0.4 — Export Formats
-- [ ] GIF export (palette-optimized, max 30fps)
-- [ ] WebM / VP9 export
-- [ ] Screenshot mode (full screen / region)
-- [ ] Copy to clipboard
-
-### v0.5 — Annotation & Overlay
-- [ ] On-screen annotation: arrows, rectangles, text
-- [ ] Highlight / spotlight effect (dim outside cursor area)
-- [ ] Webcam overlay (picture-in-picture circle)
-- [ ] Customizable watermark
 
 ### v1.0 — Presentation Mode 🎯
-- [ ] **Auto Zoom**: camera automatically follows cursor and zooms into the focused area — perfect for tutorials, demos, and walkthroughs
-- [ ] **Click Ripple**: visual ripple effect on mouse click to highlight interactions
-- [ ] **Keystroke Overlay**: display pressed keys on screen for shortcut demonstrations
-- [ ] **Spotlight Mode**: dim everything except a configurable radius around the cursor
-- [ ] **Smooth Pan**: cinematic camera movement with configurable easing curves
-- [ ] **Scene Presets**: save and switch between zoom levels / focus areas
+- [ ] **Auto Zoom**: camera automatically follows cursor and zooms into the focused area
+- [ ] **Click Ripple**: visual ripple effect on mouse click
+- [ ] **Keystroke Overlay**: display pressed keys on screen
+- [ ] **Spotlight Mode**: dim everything except area around cursor
+- [ ] **Smooth Pan**: cinematic camera movement with easing curves
 
 > **Vision**: Zureshot aims to become the go-to tool for developers and creators who record tutorials, product demos, and technical walkthroughs — combining pixel-perfect capture quality with intelligent presentation features that make every recording look professionally produced.
 
 ### Future
-- [ ] Real-time LUT / color filters (Core Image or Metal Compute)
+- [ ] Multi-display selection
+- [ ] On-screen annotation (arrows, rectangles, text)
+- [ ] Webcam overlay (picture-in-picture)
 - [ ] Auto-upload to cloud (S3, R2, custom endpoint)
 - [ ] Plugin system for custom post-processing
-- [ ] Apple Shortcuts integration
-- [ ] Menu bar recording indicator with live waveform
 
 ---
 
-## 📄 License
+## � Contact
+
+<a id="wechat"></a>
+
+Feel free to reach out via WeChat for feedback, bug reports, or feature requests:
+
+<p align="center">
+  <img src="docs/images/wechat.jpg" width="300" alt="WeChat QR Code">
+</p>
+
+---
+
+## �📄 License
 
 MIT © [Zureshot](https://github.com/anxiong2025/zureshot)

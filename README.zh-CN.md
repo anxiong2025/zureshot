@@ -5,19 +5,20 @@
 <h1 align="center">Zureshot</h1>
 
 <p align="center">
-  <strong>像素级精准的 Mac 屏幕录制工具。</strong><br>
-  Rust 构建，为 Apple Silicon 而生。
+  <strong>像素级精准的屏幕录制工具，支持 Mac 和 Linux。</strong><br>
+  Rust 构建，原生 API 驱动。
 </p>
 
 <p align="center">
   <img src="https://img.shields.io/badge/macOS-13%2B-black?logo=apple" alt="macOS 13+">
+  <img src="https://img.shields.io/badge/Linux-Ubuntu%2024.04%2B-orange?logo=ubuntu" alt="Ubuntu 24.04+">
   <img src="https://img.shields.io/badge/Apple%20Silicon-M1%20|%20M2%20|%20M3%20|%20M4-blue?logo=apple" alt="Apple Silicon">
   <img src="https://img.shields.io/badge/编码器-HEVC%20H.265-green" alt="HEVC">
   <img src="https://img.shields.io/badge/开源协议-MIT-yellow" alt="MIT">
 </p>
 
 <p align="center">
-  <a href="README.md">English</a> · <a href="README.zh-CN.md">简体中文</a>
+  <a href="README.md">English</a> · <a href="README.zh-CN.md">简体中文</a> · <a href="#wechat">💬 加微信</a>
 </p>
 
 ---
@@ -124,6 +125,7 @@ Retina 分辨率 60fps 录制 60 秒：**约 135 MB**（H.264 则超过 200 MB�
 - **🎯 窗口排除** —— 自动隐藏 Zureshot 自身界面
 - **⌨️ 快捷键** —— `⌘⇧R` 录屏，`⌘⇧A` 区域选择
 - **🌗 画质预设** —— 标准 (30fps) 和 高清 (60fps)
+- **🐧 Linux 支持** —— Ubuntu 24.04+，XDG Portal + GStreamer 管线（beta）
 
 ---
 
@@ -132,31 +134,33 @@ Retina 分辨率 60fps 录制 60 秒：**约 135 MB**（H.264 则超过 200 MB�
 ### 系统总览
 
 ```
-┌─────────────────────────────────────────────────────────────────────┐
-│                           Zureshot                                  │
-├─────────────────┬───────────────────────────────────────────────────┤
-│   UI 层         │                引擎 (Rust)                        │
-│   Svelte 5      │                                                   │
-│                 │  ┌──────────────────────────────────────────────┐ │
-│  菜单栏图标     │  │             采集管线                         │ │
-│  区域选择器     │  │                                              │ │
-│  录制控制条     │  │  SCK ──→ IOSurface ──→ VideoToolbox ──→ MP4  │ │
-│  暗化遮罩       │  │  (GPU)   (GPU/显存)    (媒体引擎)      (SSD) │ │
-│                 │  │                                              │ │
-│                 │  │  音频: SCK ──→ CMSampleBuffer ──→ AAC ──┘   │ │
-│                 │  └──────────────────────────────────────────────┘ │
-│                 │                                                   │
-│                 │  ┌─────────┐ ┌──────────┐ ┌───────────────────┐  │
-│                 │  │ capture │ │  writer  │ │    commands       │  │
-│                 │  │   .rs   │ │   .rs    │ │      .rs          │  │
-│                 │  │ SCK 接口│ │ AVAsset  │ │ Tauri IPC 桥接    │  │
-│                 │  │ 帧委托  │ │ 编码写入 │ │ 状态管理          │  │
-│                 │  └─────────┘ └──────────┘ └───────────────────┘  │
-├─────────────────┴───────────────────────────────────────────────────┤
-│                    Tauri v2 + objc2 FFI                             │
-├─────────────────────────────────────────────────────────────────────┤
-│  macOS: ScreenCaptureKit │ VideoToolbox │ AVFoundation │ CoreMedia  │
-└─────────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────────┐
+│                           Zureshot                                      │
+├─────────────────┬───────────────────────────────────────────────────────┤
+│   UI 层         │                  引擎 (Rust)                          │
+│   Svelte 5      │                                                       │
+│   (100% 共享)   │  ┌──────────────────────────────────────────────────┐ │
+│                 │  │            平台抽象层 platform/mod.rs             │ │
+│  菜单栏图标     │  │                                                  │ │
+│  区域选择器     │  │  ┌──── macOS ─────┐   ┌──── Linux ──────────┐    │ │
+│  录制控制条     │  │  │ SCK→IOSurf→    │   │ XDG Portal→         │    │ │
+│  暗化遮罩       │  │  │ VideoToolbox   │   │ PipeWire→GStreamer  │    │ │
+│  截图预览       │  │  │ →HEVC→MP4      │   │ →x264→MP4           │    │ │
+│                 │  │  └────────────────┘   └─────────────────────┘    │ │
+│                 │  └──────────────────────────────────────────────────┘ │
+│                 │                                                       │
+│                 │  ┌──────────┐ ┌──────────┐ ┌────────────────┐        │
+│                 │  │ commands │ │   tray   │ │     lib        │        │
+│                 │  │   .rs    │ │   .rs    │ │     .rs        │        │
+│                 │  │ IPC 命令 │ │ 菜单栏   │ │ 引导启动       │        │
+│                 │  └──────────┘ └──────────┘ └────────────────┘        │
+├─────────────────┴───────────────────────────────────────────────────────┤
+│                           Tauri v2                                      │
+├──────────────────────────────────┬──────────────────────────────────────┤
+│  macOS: ScreenCaptureKit        │  Linux: XDG Portal + GStreamer       │
+│  VideoToolbox + AVFoundation    │  PipeWire + x264 + ffmpeg            │
+│  objc2 FFI                      │  子进程管线（零外部 crate）          │
+└──────────────────────────────────┴──────────────────────────────────────┘
 ```
 
 ### 数据流向 —— 零拷贝路径
@@ -190,35 +194,70 @@ Retina 分辨率 60fps 录制 60 秒：**约 135 MB**（H.264 则超过 200 MB�
 
 **核心要点**：像素数据（例如 3200×2132 × 1.5 字节/像素 = ~10 MB/帧）始终停留在统一 GPU 内存中。只有极小的压缩 NALU（~50-100 KB/帧）经过 CPU 内存写入磁盘。
 
+### 数据流向 —— Linux（GStreamer 管线）
+
+```
+  用户点击录制
+        │
+        ▼
+  XDG Desktop Portal (D-Bus)
+    └─ CreateSession → SelectSources → Start
+    └─ 用户在系统弹窗中确认共享屏幕/窗口
+    └─ 返回 PipeWire node_id
+        │
+        ▼
+  gst-launch-1.0 子进程
+    └─ pipewiresrc（捕获 PipeWire 流）
+    └─ videoconvert → videoscale → videocrop
+    └─ x264enc（H.264 软件编码）
+    └─ mp4mux → filesink（MP4 输出）
+    └─ （可选）pulsesrc → audioconvert → faac
+        │
+        ▼
+  暂停: SIGINT → EOS → 保存段文件
+  恢复: 新 gst-launch 进程 → 新段
+  停止: ffmpeg 拼接 → 最终 MP4
+```
+
+> **注意**：Linux 当前使用软件 H.264 编码。硬件加速编码（VA-API/NVENC，HEVC）计划在 v0.6.0 中实现。
+
 ### 源文件结构
 
 | 文件 | 行数 | 职责 |
 |------|------|------|
-| `capture.rs` | ~650 | SCK 流配置、SCStreamOutput 委托、帧路由、PTS 单调性保证 |
-| `writer.rs` | ~470 | AVAssetWriter 创建、HEVC 编码参数、BT.709 色彩、文件终结 |
-| `commands.rs` | ~820 | Tauri IPC 命令、录制状态机、窗口管理 |
-| `tray.rs` | ~250 | 系统托盘图标、右键菜单、快捷键处理 |
-| `lib.rs` | ~60 | 应用引导、插件注册 |
+| `platform/mod.rs` | ~56 | 平台抽象：共享类型、条件编译 |
+| `platform/macos/mod.rs` | ~340 | macOS RecordingHandle、生命周期、系统集成 |
+| `platform/macos/capture.rs` | ~650 | SCK 流、SCStreamOutput 委托、帧路由、PTS |
+| `platform/macos/writer.rs` | ~470 | AVAssetWriter、HEVC 编码、BT.709、文件终结 |
+| `platform/linux/mod.rs` | ~430 | Linux RecordingHandle、生命周期、系统集成 |
+| `platform/linux/portal.rs` | ~315 | XDG Desktop Portal ScreenCast（D-Bus via Python）|
+| `platform/linux/writer.rs` | ~360 | GStreamer 管线管理（gst-launch 子进程）|
+| `platform/linux/capture.rs` | ~90 | 截屏（gnome-screenshot / grim）|
+| `commands.rs` | ~940 | Tauri IPC 命令、录制状态机、窗口管理 |
+| `tray.rs` | ~520 | 系统托盘、菜单、自动启动、更新检查 |
+| `lib.rs` | ~70 | 应用引导、插件注册 |
 
 **Rust** 处理所有采集、编码和文件 I/O。UI 是轻量的 Svelte 层（约 5 个组件），负责菜单栏、区域选择和录制控制。Tauri v2 通过类型安全的 IPC 连接两者。
 
 ### 技术栈
 
-| 层 | 技术 | 选型理由 |
-|----|------|----------|
-| 采集 | ScreenCaptureKit (macOS 12.3+) | 新一代采集 API，原生 GPU IOSurface 输出 |
-| 像素格式 | NV12 (`420v`) | HEVC 编码器原生格式——零色彩空间转换 |
-| 色彩空间 | sRGB 采集 → BT.709 编码 | 无损元数据匹配，无隐式转换 |
-| 编码 | VideoToolbox HEVC Main | Apple Media Engine 硬件编码，约 3% CPU |
-| 封装 | AVAssetWriter → MP4 | 原生 Apple 封装器，正确的 moov atom，即时拖拽 |
-| 音频 | AAC 48kHz 立体声，128kbps | 系统声音 + 麦克风，双轨录制 |
-| FFI | objc2 0.6 + block2 0.6 | 类型安全的 Rust ↔ Objective-C 桥接 |
-| 应用外壳 | Tauri v2 | 轻量原生包装，约 3 MB 二进制 |
-| 前端 | Svelte 5 + Vite | 极简 UI，仅用于遮罩和控件 |
+| 层 | macOS | Linux |
+|----|-------|-------|
+| 采集 | ScreenCaptureKit（GPU 零拷贝） | XDG Desktop Portal + PipeWire |
+| 编码 | VideoToolbox HEVC（硬件编码） | x264 H.264（软件编码，VA-API 计划中） |
+| 封装 | AVAssetWriter → MP4 | GStreamer mp4mux → MP4 |
+| 音频 | ScreenCaptureKit AAC | PulseAudio + GStreamer AAC |
+| 截屏 | CGWindowListCreateImage | gnome-screenshot / grim |
+| FFI | objc2 0.6 + block2 0.6 | 子进程（零原生 crate 依赖）|
+| 对话框 | osascript（AppleScript） | zenity / kdialog |
+| 应用外壳 | Tauri v2 | Tauri v2 |
+| 前端 | Svelte 5 + Vite（100% 共享） | Svelte 5 + Vite（100% 共享） |
 
 ---
 
 ## 🚀 快速开始
+
+### macOS
 
 ```bash
 # 前置条件：Rust、Node.js、pnpm
@@ -230,6 +269,39 @@ pnpm tauri dev
 
 > **首次启动**：macOS 会请求屏幕录制权限。前往 **系统设置 → 隐私与安全性 → 屏幕录制** 中授权，然后重启应用。
 
+### Linux (Ubuntu 24.04+)
+
+```bash
+# 安装系统依赖
+sudo apt-get install -y \
+  libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf \
+  xdg-desktop-portal zenity python3 python3-dbus python3-gi \
+  gir1.2-glib-2.0 gstreamer1.0-tools gstreamer1.0-plugins-base \
+  gstreamer1.0-plugins-good gstreamer1.0-plugins-ugly \
+  gstreamer1.0-pipewire ffmpeg
+
+# 从源码构建
+git clone https://github.com/anxiong2025/zureshot.git
+cd zureshot
+pnpm install
+pnpm tauri dev
+```
+
+或从 Release 安装：
+
+```bash
+# .deb 包
+sudo dpkg -i Zureshot_*.deb
+
+# 或 AppImage
+chmod +x Zureshot_*.AppImage
+./Zureshot_*.AppImage
+```
+
+> **首次启动**：首次录屏或截图时，桌面环境会弹出 Portal 对话框，询问共享哪个屏幕/窗口。这是标准的 Linux 安全机制。
+
+> ⚠️ **Linux 支持目前为 beta 状态。** 录屏使用 XDG Desktop Portal + GStreamer。已在 Ubuntu 24.04 GNOME (Wayland) 上测试。欢迎反馈和提 bug！
+
 ---
 
 ## 🔧 生产构建
@@ -238,7 +310,9 @@ pnpm tauri dev
 pnpm tauri build
 ```
 
-`.dmg` 安装包会在 `src-tauri/target/release/bundle/dmg/` 目录下。
+**macOS：** `.dmg` 安装包在 `src-tauri/target/release/bundle/dmg/` 目录下。
+
+**Linux：** `.deb` 和 `.AppImage` 在 `src-tauri/target/release/bundle/deb/` 和 `src-tauri/target/release/bundle/appimage/` 目录下。
 
 ---
 
@@ -269,55 +343,88 @@ pnpm tauri build
 | 要求 | 最低 | 推荐 |
 |------|------|------|
 | **macOS** | 13.0 Ventura | 14.0+ Sonoma |
+| **Linux** | Ubuntu 24.04 (Wayland) | GNOME 桌面 |
 | **内存** | 8 GB | 16 GB |
 | **磁盘** | ~200 MB/分钟（标准画质） | 推荐 SSD |
 | **显示器** | 任意分辨率 | Retina (2x) 画质最佳 |
+
+### Linux 环境要求（beta）
+
+| 组件 | 必需 | 说明 |
+|------|------|------|
+| **桌面** | GNOME（推荐 Wayland） | X11 也支持 |
+| **显示服务** | PipeWire | 屏幕采集传输 |
+| **Portal** | XDG Desktop Portal | 权限管理 & 源选择 |
+| **编码** | GStreamer + x264 | 视频编码（H.264）|
+| **音频** | PulseAudio / PipeWire-Pulse | 系统音频采集 |
+| **截屏** | gnome-screenshot / grim | 区域截图 |
+| **对话框** | zenity | 原生对话框 |
+
+> 🐧 Linux 录屏使用 GStreamer 子进程管线 + H.264 编码。硬件加速编码（VA-API、NVENC）计划在未来版本中实现。
 
 ---
 
 ## 🗺 路线图
 
-### v0.2 — 修剪与导出
+### ✅ v0.4 — 当前版本
+- [x] 全屏 & 区域录制（macOS: HEVC 零拷贝）
+- [x] 暂停 / 恢复
+- [x] 系统声音 + 麦克风采集
+- [x] GIF 导出（调色板优化，最高 30fps）
+- [x] 截图模式（全屏 / 区域）+ 预览
+- [x] 复制到剪贴板
+- [x] 录制倒计时（3-2-1）
+- [x] 录制停止时缩略图预览
+- [x] 画质预设（标准 30fps / 高清 60fps）
+- [x] 自动更新（Tauri updater）
+
+### 🚧 v0.5.0-beta — Linux 支持（当前）
+- [x] 平台抽象层（macOS + Linux 同一代码库）
+- [x] Linux 录屏（XDG Portal + GStreamer + PipeWire）
+- [x] Linux 截屏（gnome-screenshot / grim）
+- [x] Linux 系统集成（zenity 对话框、xdg-open、开机自启）
+- [x] CI/CD：macOS + Ubuntu 双平台构建 & 发布
+- [ ] Ubuntu 24.04 实机验证
+
+### 🔮 v0.6.0-beta — Linux 性能优化
+- [ ] 纯 Rust D-Bus（zbus crate，移除 Python 依赖）
+- [ ] 进程内 GStreamer 管线（gstreamer-rs crate）
+- [ ] 硬件编码：VA-API (Intel/AMD) / NVENC (NVIDIA)
+- [ ] Linux 端 HEVC (H.265) 输出
+- [ ] 无缝暂停/恢复（GstPipeline 状态切换，无段拼接）
+
+### v0.7 — 修剪与导出
 - [ ] 录制结束后弹出预览窗口
 - [ ] 拖拽修剪：首尾 Range Slider
 - [ ] Stream copy 极速导出（不重编码，秒级完成）
-- [ ] 可选硬件加速 4K → 1080p 转码
-
-### v0.3 — 体验打磨
-- [ ] 多显示器选择
-- [ ] 录制停止时缩略图预览
-- [ ] 全局设置面板（输出路径、格式、画质）
-- [ ] 导出后自动在 Finder 中打开
-- [ ] 录制倒计时（3-2-1）
-
-### v0.4 — 导出格式
-- [ ] GIF 导出（调色板优化，最高 30fps）
-- [ ] WebM / VP9 导出
-- [ ] 截图模式（全屏 / 区域）
-- [ ] 复制到剪贴板
-
-### v0.5 — 标注与覆盖层
-- [ ] 屏幕标注：箭头、矩形、文字
-- [ ] 高亮 / 聚光灯效果（光标区域外自动暗化）
-- [ ] 摄像头画中画（圆形浮窗）
-- [ ] 自定义水印
 
 ### v1.0 — 演示模式 🎯
-- [ ] **自动缩放**：摄像机自动跟随光标并放大聚焦区域——录教程、做 Demo、技术演示的神器
-- [ ] **点击涟漪**：鼠标点击时产生视觉涟漪效果，突出交互操作
-- [ ] **按键显示**：在屏幕上实时展示键盘按键，适合快捷键演示
+- [ ] **自动缩放**：摄像机自动跟随光标并放大聚焦区域
+- [ ] **点击涟漪**：鼠标点击时产生视觉涟漪效果
+- [ ] **按键显示**：在屏幕上实时展示键盘按键
 - [ ] **聚光灯模式**：光标周围可配置半径保持明亮，其余区域自动暗化
 - [ ] **平滑跟随**：电影级摄像机移动，可配置缓动曲线
-- [ ] **场景预设**：保存并快速切换不同的缩放级别 / 聚焦区域
 
 > **愿景**：Zureshot 致力于成为开发者和内容创作者录制教程、产品演示和技术讲解的首选工具——将像素级精准的录制品质与智能演示功能相结合，让每一段录屏都呈现专业制作级的效果。
 
 ### 远期展望
-- [ ] 实时 LUT / 色彩滤镜（Core Image 或 Metal Compute）
+- [ ] 多显示器选择
+- [ ] 屏幕标注（箭头、矩形、文字）
+- [ ] 摄像头画中画
 - [ ] 自动上传云端（S3、R2、自定义端点）
 - [ ] 插件系统，支持自定义后处理
-- [ ] Apple 快捷指令集成
-- [ ] 菜单栏录制指示器 + 实时音频波形
+
+---
+
+## 💬 联系作者
+
+<a id="wechat"></a>
+
+欢迎加微信交流、反馈 bug、提需求：
+
+<p align="center">
+  <img src="docs/images/wechat.jpg" width="300" alt="微信二维码">
+</p>
 
 ---
 
