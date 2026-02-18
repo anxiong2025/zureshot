@@ -255,22 +255,64 @@ image = "0.25"
 - [x] **1.9** 创建 GitHub Actions CI：macOS + Ubuntu 双平台构建
 - [x] **1.10** CI 验证通过：macOS .dmg + Ubuntu .deb/.rpm/.AppImage 全部构建成功
 
-### Phase 2：录屏功能
+### Phase 2：录屏功能 ✅ 代码完成
 
-> 预估工时：**5-7 天**
+> 预估工时：**5-7 天** → 实际代码 **1 天**（2026-02-19），待实机验证
 > 目标：完整录屏功能（区域录屏 + 全屏 + 音频）
+> 方案：纯子进程方案（零新 Rust crate），可在 macOS 上交叉编译
 
-- [ ] **2.1** 实现 `platform/linux/writer.rs`：GStreamer 管线搭建（H.264 编码 → MP4）
-- [ ] **2.2** 实现 PipeWire 屏幕流接收（XDG Portal ScreenCast → PipeWire fd）
-- [ ] **2.3** 区域录屏：从 PipeWire 流中裁剪指定区域
-- [ ] **2.4** 全屏录屏
-- [ ] **2.5** 暂停/恢复录屏（GStreamer 管线控制）
-- [ ] **2.6** 系统音频捕获（PipeWire / PulseAudio）
-- [ ] **2.7** 麦克风捕获
-- [ ] **2.8** GIF 转换（ffmpeg，已有跨平台逻辑可复用）
-- [ ] **2.9** 录制质量选项（Standard 30fps / High 60fps）
-- [ ] **2.10** 录制控制条（recording-bar）和 dim overlay 窗口
-- [ ] **2.11** 验证：区域选择 → 录制 → 暂停/恢复 → 停止 → MP4 可播放
+- [x] **2.1** 实现 `platform/linux/writer.rs`：gst-launch-1.0 子进程（H.264 x264enc → MP4）
+- [x] **2.2** 实现 PipeWire 屏幕流接收：`portal.rs` 嵌入 Python 脚本调用 XDG Portal ScreenCast D-Bus
+- [x] **2.3** 区域录屏：GStreamer videocrop 元素裁剪指定区域
+- [x] **2.4** 全屏录屏：pipewiresrc → videoconvert → x264enc → mp4mux → filesink
+- [x] **2.5** 暂停/恢复录屏：段式录制（SIGINT→EOS 保存段文件，resume 启动新 gst-launch）
+- [x] **2.6** 系统音频捕获：pulsesrc + pactl get-default-sink monitor 源（PipeWire 兼容层）
+- [x] **2.7** 麦克风捕获：pulsesrc 直接捕获默认输入设备
+- [x] **2.8** GIF 转换：ffmpeg（已有跨平台逻辑可复用，无需修改）
+- [x] **2.9** 录制质量选项：Standard 30fps / High 60fps + 自适应码率（5-24 Mbps）
+- [x] **2.10** 录制控制条（recording-bar）和 dim overlay：前端 100% 复用，无需修改
+- [ ] **2.11** 验证：区域选择 → 录制 → 暂停/恢复 → 停止 → MP4 可播放（待实机测试）
+
+### Phase 2.5：性能优化 — 榨干 Linux 硬件性能
+
+> 预估工时：**5-8 天**（需要 Linux 实机开发环境）
+> 目标：从 "能用" 升级到 "极致"，对标 macOS 版 ScreenCaptureKit + VideoToolbox 的性能水平
+> 前置条件：Phase 2 实机验证通过，Phase 3 基本完成
+
+**当前 MVP 方案 vs 优化后对比：**
+
+| 维度 | MVP（子进程方案） | 优化后（Rust crate 方案） | 预期提升 |
+|------|------------------|--------------------------|----------|
+| Portal 交互 | python3 子进程 + D-Bus | `zbus` crate 纯 Rust D-Bus | 启动快 200ms+，去掉 python 运行时依赖 |
+| 视频编码 | x264enc 纯 CPU 软编码 | VA-API (Intel/AMD) / NVENC (NVIDIA) 硬件编码 | CPU 占用降 80%+，功耗大幅降低 |
+| 编码格式 | H.264 | H.265 (HEVC) via vaapih265enc | 同质量下文件体积减 40% |
+| GStreamer 集成 | gst-launch-1.0 子进程 | `gstreamer-rs` crate 进程内管线 | 零拷贝数据流，延迟更低 |
+| 暂停/恢复 | 停进程 + ffmpeg 段拼接 | GstPipeline 状态切换 PAUSED↔PLAYING | 无段文件 IO，无拼接开销，瞬间暂停 |
+| 帧捕获 | 依赖 GStreamer pipewiresrc | `pipewire` crate 直接读帧 | 更精细的帧控制和时间戳管理 |
+
+- [ ] **2.5.1** 替换 Portal 交互：python3 子进程 → `zbus` crate 纯 Rust D-Bus 通信
+- [ ] **2.5.2** 替换 GStreamer 集成：gst-launch-1.0 子进程 → `gstreamer-rs` 进程内管线
+- [ ] **2.5.3** 硬件编码支持：检测 VA-API/NVENC → 优先硬件编码，fallback 到 x264
+- [ ] **2.5.4** HEVC (H.265) 编码：vaapih265enc / nvh265enc，对标 macOS VideoToolbox HEVC
+- [ ] **2.5.5** 管线内暂停/恢复：GstPipeline PAUSED↔PLAYING 状态切换，移除段拼接
+- [ ] **2.5.6** PipeWire 直接集成：`pipewire` crate 替代 pipewiresrc，精细帧控制
+- [ ] **2.5.7** 零拷贝优化：DMA-BUF 共享内存，避免 GPU→CPU→GPU 拷贝
+- [ ] **2.5.8** 自适应编码器选择：运行时探测硬件能力，自动选择最优编码路径
+- [ ] **2.5.9** 性能基准测试：CPU 占用、内存、帧率、文件大小 vs macOS 版对比
+- [ ] **2.5.10** Cargo.toml 更新：添加 Linux-only crate 条件依赖（zbus, gstreamer-rs, pipewire）
+
+**新增 Rust crate 依赖（仅 Linux）：**
+```toml
+[target.'cfg(target_os = "linux")'.dependencies]
+zbus = "4"                    # D-Bus 通信（替代 python3-dbus）
+gstreamer = "0.23"            # GStreamer Rust 绑定
+gstreamer-app = "0.23"        # GStreamer appsrc/appsink
+gstreamer-video = "0.23"      # GStreamer 视频处理
+pipewire = "0.8"              # PipeWire 直接集成
+```
+
+> ⚠️ 这些 crate 是 Linux-only 的，CI 的 Ubuntu job 需要安装对应 -dev 包。
+> macOS job 不受影响（条件编译）。
 
 ### Phase 3：完善体验
 
@@ -298,7 +340,7 @@ image = "0.25"
 | XDG Portal 权限弹窗 | 每次截屏/录屏都会弹出系统权限确认 | Portal 有 `Restore` token 机制可记住选择 |
 | PipeWire 版本差异 | 不同发行版 PipeWire 版本可能不同 | 锁定 Ubuntu 24.04 版本，不追求广泛兼容 |
 | 区域裁剪精度 | Wayland 下没有全局坐标系 | 使用 Portal 的 `SelectSources` 进行区域选择 |
-| 硬件编码可用性 | VA-API/NVENC 不一定存在 | MVP 用软件编码（x264），后续可选硬件加速 |
+| 硬件编码可用性 | VA-API/NVENC 不一定存在 | Phase 2 用软件编码（x264），Phase 2.5 加硬件编码 + fallback |
 | 全局快捷键 | Wayland 限制后台键盘监听 | 使用 `GlobalShortcuts` Portal 或依赖托盘菜单 |
 | HiDPI 缩放 | 不同缩放比例下坐标计算 | 测试 100%/125%/150%/200% 缩放 |
 | 自动更新签名 | `TAURI_SIGNING_PRIVATE_KEY` 需配置到 GitHub Secrets 才能签名更新包 | Phase 3 发布前配置，当前 CI 已跳过签名步骤 |
@@ -307,14 +349,16 @@ image = "0.25"
 
 ## 六、工作量总结
 
-| 阶段 | 新增代码 | 修改代码 | 预估工时 |
-|------|---------|---------|---------|
-| Phase 1 (MVP 截屏) | ~600 行 Rust + ~100 行 YAML | ~300 行重构 | 3-5 天 |
-| Phase 2 (录屏) | ~800-1000 行 Rust | ~200 行重构 | 5-7 天 |
-| Phase 3 (完善) | ~200 行 Rust + 文档 | ~100 行微调 | 2-3 天 |
-| **合计** | **~1600-1900 行新代码** | **~600 行重构** | **10-15 天** |
+| 阶段 | 新增代码 | 修改代码 | 预估工时 | 状态 |
+|------|---------|---------|---------|------|
+| Phase 1 (构建+截屏) | ~600 行 Rust + ~100 行 YAML | ~300 行重构 | 3-5 天 → 实际 2 天 | ✅ 完成 |
+| Phase 2 (录屏 MVP) | ~860 行 Rust | ~30 行修改 | 5-7 天 → 实际 1 天 | ✅ 代码完成 |
+| Phase 2.5 (性能优化) | ~1200-1500 行 Rust | ~800 行重写 | 5-8 天 | ⬜ 计划中 |
+| Phase 3 (完善体验) | ~200 行 Rust + 文档 | ~100 行微调 | 2-3 天 | ⬜ 未开始 |
+| **合计** | **~2900-3300 行新代码** | **~1230 行重构** | **15-23 天** |
 
-> 对比：macOS 版现有 Rust 代码约 3100 行。Linux 版约需新增 1800 行 + 重构 600 行。
+> 对比：macOS 版现有 Rust 代码约 3100 行。Linux 版最终约 3000+ 行新代码。
+> Phase 2.5 是可选的性能优化阶段，不影响功能发布。建议路线：Phase 2→3→发布 v0.5.0→2.5→发布 v0.6.0。
 
 ---
 
@@ -327,9 +371,17 @@ image = "0.25"
 - [ ] 系统托盘图标正常显示和交互（待实机测试）
 - [ ] 截屏功能可用（区域选择 → 截图 → 保存/复制）（待实机测试）
 
-### 完整版 (Phase 3 完成)
+### 完整版 (Phase 3 完成) → v0.5.0
 - [ ] 录屏功能完整（全屏/区域 + 音频 + 暂停/恢复）
 - [ ] 录制文件可正常播放
 - [ ] 全局快捷键可用
 - [ ] 自动更新可用
 - [ ] GNOME Wayland 和 X11 下均正常工作
+
+### 极致性能版 (Phase 2.5 完成) → v0.6.0
+- [ ] 硬件编码可用（VA-API 或 NVENC，根据用户硬件自动选择）
+- [ ] 录制时 CPU 占用 < 10%（对比 MVP 软编码 ~30-50%）
+- [ ] HEVC 输出：同画质文件体积比 H.264 减少 30%+
+- [ ] 暂停/恢复无缝切换（无段文件拼接）
+- [ ] 无 python3 运行时依赖（纯 Rust D-Bus）
+- [ ] 性能基准：与 macOS 版 ScreenCaptureKit + VideoToolbox 对比在同一量级
