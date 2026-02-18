@@ -48,7 +48,17 @@
           "libwebkit2gtk-4.1-0",
           "libappindicator3-1",
           "xdg-desktop-portal",
-          "zenity"
+          "zenity",
+          "python3",
+          "python3-dbus",
+          "python3-gi",
+          "gir1.2-glib-2.0",
+          "gstreamer1.0-tools",
+          "gstreamer1.0-plugins-base",
+          "gstreamer1.0-plugins-good",
+          "gstreamer1.0-plugins-ugly",
+          "gstreamer1.0-pipewire",
+          "ffmpeg"
         ],
         "section": "utils",
         "desktopTemplate": null
