@@ -1,233 +1,510 @@
-//! Linux video writer — GStreamer pipeline management via `gst-launch-1.0`.
+//! Linux video writer — in-process GStreamer pipeline via `gstreamer-rs`.
 //!
-//! Architecture:
-//!   XDG Portal → PipeWire node_id
-//!   gst-launch-1.0: pipewiresrc → videoconvert → x264enc → mp4mux → filesink
-//!   (optional)      pulsesrc → audioconvert → avenc_aac → mp4mux
+//! Phase 2.5 rewrite: replaces the gst-launch-1.0 subprocess approach with
+//! a native Rust GStreamer pipeline, providing:
+//!   - **Zero subprocess overhead**: pipeline runs in-process
+//!   - **Native pause/resume**: GstPipeline PAUSED ↔ PLAYING (no segments)
+//!   - **Hardware encoding**: VA-API (Intel/AMD) / NVENC (NVIDIA) auto-detection
+//!   - **HEVC (H.265)**: when hardware encoder supports it (40% smaller files)
+//!   - **EOS-based stop**: clean MP4 finalization via EOS event
 //!
-//! Pause/resume uses segment-based recording:
-//!   - Pause: send SIGINT to gst-launch (triggers EOS, clean shutdown)
-//!   - Resume: start new gst-launch process (new segment file)
-//!   - Stop + Finalize: concatenate segments with ffmpeg
+//! Pipeline topology:
+//!   pipewiresrc → videoconvert → [videocrop] → videorate → capsfilter
+//!     → encoder → parser → mp4mux → filesink
+//!   [pulsesrc → audioconvert → audioresample → capsfilter
+//!     → avenc_aac → aacparse → mp4mux]
 
+use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+
+use gstreamer as gst;
+use gst::prelude::*;
 
 use crate::platform::RecordingQuality;
 
-/// A running GStreamer recording pipeline (gst-launch-1.0 process).
+/// Detected encoder information.
+#[derive(Debug, Clone)]
+pub struct EncoderInfo {
+    /// GStreamer element factory name (e.g., "vaapih264enc", "x264enc").
+    pub name: &'static str,
+    /// Whether this is an HEVC (H.265) encoder.
+    pub is_hevc: bool,
+    /// Whether this is a hardware encoder.
+    pub is_hardware: bool,
+    /// Human-readable description.
+    pub description: &'static str,
+}
+
+/// An in-process GStreamer recording pipeline.
+///
+/// Supports native pause/resume via GStreamer state changes.
+/// No segment files, no subprocess, no ffmpeg concatenation.
 pub struct GstPipeline {
-    /// The gst-launch-1.0 child process.
-    process: Child,
-    /// Output file path for this segment.
+    /// The GStreamer pipeline instance.
+    pipeline: gst::Pipeline,
+    /// Output file path.
     output_path: PathBuf,
+    /// Encoder info (for logging).
+    encoder_info: EncoderInfo,
 }
 
 impl GstPipeline {
-    /// Stop the pipeline gracefully by sending SIGINT (triggers EOS).
-    ///
-    /// GStreamer's `-e` flag ensures that SIGINT causes an EOS event,
-    /// which flushes the muxer and writes a valid MP4 file.
-    pub fn stop(&mut self) -> Result<(), String> {
-        let pid = self.process.id();
-        println!("[zureshot-linux] Sending SIGINT to gst-launch (PID: {})", pid);
-
-        // Send SIGINT via kill command (avoids libc dependency)
-        let _ = Command::new("kill")
-            .args(["-s", "INT", &pid.to_string()])
-            .output();
-
-        // Wait for process to finish (with timeout)
-        let start = std::time::Instant::now();
-        let timeout = std::time::Duration::from_secs(10);
-
-        loop {
-            match self.process.try_wait() {
-                Ok(Some(status)) => {
-                    println!("[zureshot-linux] gst-launch exited: {}", status);
-                    return Ok(());
-                }
-                Ok(None) => {
-                    if start.elapsed() > timeout {
-                        println!("[zureshot-linux] gst-launch timeout, force killing");
-                        let _ = self.process.kill();
-                        let _ = self.process.wait();
-                        return Ok(());
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(100));
-                }
-                Err(e) => {
-                    return Err(format!("Failed to wait for gst-launch: {}", e));
-                }
-            }
-        }
-    }
-
-    /// Get the output file path of this segment.
+    /// Get the output file path.
     pub fn output_path(&self) -> &Path {
         &self.output_path
     }
+
+    /// Get encoder info.
+    pub fn encoder_info(&self) -> &EncoderInfo {
+        &self.encoder_info
+    }
+
+    /// Pause the pipeline (instant, no segment files).
+    ///
+    /// GStreamer handles buffering internally. When resumed, recording
+    /// continues seamlessly from where it paused.
+    pub fn pause(&self) -> Result<(), String> {
+        println!("[zureshot-linux] Pausing GStreamer pipeline...");
+        self.pipeline
+            .set_state(gst::State::Paused)
+            .map_err(|e| format!("Failed to pause pipeline: {e:?}"))?;
+        println!("[zureshot-linux] Pipeline paused");
+        Ok(())
+    }
+
+    /// Resume the pipeline (instant, no new segment).
+    pub fn resume(&self) -> Result<(), String> {
+        println!("[zureshot-linux] Resuming GStreamer pipeline...");
+        self.pipeline
+            .set_state(gst::State::Playing)
+            .map_err(|e| format!("Failed to resume pipeline: {e:?}"))?;
+        println!("[zureshot-linux] Pipeline resumed");
+        Ok(())
+    }
+
+    /// Stop the pipeline gracefully via EOS.
+    ///
+    /// Sends an EOS event through the pipeline, which flushes the muxer
+    /// and writes a valid MP4 file. Then transitions to Null state.
+    pub fn stop(&self) -> Result<(), String> {
+        println!("[zureshot-linux] Stopping GStreamer pipeline (sending EOS)...");
+
+        // Send EOS event
+        if !self.pipeline.send_event(gst::event::Eos::builder().build()) {
+            println!("[zureshot-linux] Warning: failed to send EOS event");
+        }
+
+        // Wait for EOS message on the bus (or error/timeout)
+        let bus = self.pipeline.bus().ok_or("Pipeline has no bus")?;
+        let timeout = gst::ClockTime::from_seconds(15);
+        let msg = bus.timed_pop_filtered(
+            Some(timeout),
+            &[gst::MessageType::Eos, gst::MessageType::Error],
+        );
+
+        match msg {
+            Some(msg) => match msg.view() {
+                gst::MessageView::Eos(..) => {
+                    println!("[zureshot-linux] EOS received — MP4 finalized");
+                }
+                gst::MessageView::Error(err) => {
+                    let debug = err.debug().unwrap_or_default();
+                    println!(
+                        "[zureshot-linux] GStreamer error during stop: {} ({debug})",
+                        err.error()
+                    );
+                }
+                _ => {}
+            },
+            None => {
+                println!("[zureshot-linux] Warning: EOS timeout (15s), force stopping");
+            }
+        }
+
+        // Transition to Null state
+        self.pipeline
+            .set_state(gst::State::Null)
+            .map_err(|e| format!("Failed to set Null state: {e:?}"))?;
+
+        println!(
+            "[zureshot-linux] Pipeline stopped. Output: {}",
+            self.output_path.display()
+        );
+        Ok(())
+    }
 }
 
-/// Configuration for starting a GStreamer pipeline.
+impl Drop for GstPipeline {
+    fn drop(&mut self) {
+        // Ensure pipeline is cleaned up
+        let _ = self.pipeline.set_state(gst::State::Null);
+    }
+}
+
+/// Configuration for building a GStreamer pipeline.
 pub struct PipelineConfig {
+    /// PipeWire node ID (from portal).
     pub node_id: u32,
+    /// PipeWire remote fd (from portal).
+    pub fd: i32,
+    /// Output file path.
     pub output_path: String,
+    /// Frames per second.
     pub fps: i32,
+    /// Target bitrate in kbps.
     pub bitrate_kbps: i32,
-    /// Source stream dimensions (from portal, for crop calculation).
+    /// Source stream dimensions (from portal).
     pub source_width: Option<u32>,
     pub source_height: Option<u32>,
     /// Region crop in pixels: (x, y, width, height).
     pub region: Option<(i32, i32, i32, i32)>,
+    /// Capture system audio via PulseAudio monitor source.
     pub capture_system_audio: bool,
+    /// Capture microphone input.
     pub capture_mic: bool,
 }
 
-/// Build and start a GStreamer recording pipeline.
+/// Detect the best available video encoder.
 ///
-/// Spawns `gst-launch-1.0 -e <pipeline>` as a child process.
-/// The `-e` flag ensures SIGINT triggers EOS for clean MP4 finalization.
+/// Priority order:
+///   1. VA-API H.265 (Intel/AMD hardware, best compression)
+///   2. NVENC H.265 (NVIDIA hardware, best compression)
+///   3. VA-API H.264 (Intel/AMD hardware)
+///   4. NVENC H.264 (NVIDIA hardware)
+///   5. x264enc (software fallback, always available)
+///
+/// Returns info about the selected encoder.
+pub fn detect_best_encoder() -> EncoderInfo {
+    let candidates: &[EncoderInfo] = &[
+        EncoderInfo {
+            name: "vaapih265enc",
+            is_hevc: true,
+            is_hardware: true,
+            description: "VA-API HEVC (Intel/AMD GPU)",
+        },
+        EncoderInfo {
+            name: "nvh265enc",
+            is_hevc: true,
+            is_hardware: true,
+            description: "NVENC HEVC (NVIDIA GPU)",
+        },
+        EncoderInfo {
+            name: "vaapih264enc",
+            is_hevc: false,
+            is_hardware: true,
+            description: "VA-API H.264 (Intel/AMD GPU)",
+        },
+        EncoderInfo {
+            name: "nvh264enc",
+            is_hevc: false,
+            is_hardware: true,
+            description: "NVENC H.264 (NVIDIA GPU)",
+        },
+        EncoderInfo {
+            name: "x264enc",
+            is_hevc: false,
+            is_hardware: false,
+            description: "x264 H.264 (CPU software)",
+        },
+    ];
+
+    for info in candidates {
+        if gst::ElementFactory::find(info.name).is_some() {
+            println!(
+                "[zureshot-linux] Encoder selected: {} ({})",
+                info.name, info.description
+            );
+            return info.clone();
+        }
+    }
+
+    // Ultimate fallback (x264enc should always be available)
+    println!("[zureshot-linux] Warning: no encoder found, defaulting to x264enc");
+    candidates.last().unwrap().clone()
+}
+
+/// Build and start an in-process GStreamer recording pipeline.
+///
+/// Returns a `GstPipeline` handle for pause/resume/stop control.
 pub fn start_pipeline(config: &PipelineConfig) -> Result<GstPipeline, String> {
-    let pipeline_str = build_pipeline_string(config)?;
-    println!("[zureshot-linux] GStreamer pipeline:\n  {}", pipeline_str);
+    // Initialize GStreamer (safe to call multiple times)
+    gst::init().map_err(|e| format!("GStreamer init failed: {e}"))?;
 
-    // gst-launch-1.0 takes the pipeline description as space-separated args
-    let args: Vec<&str> = pipeline_str.split_whitespace().collect();
+    let pipeline = gst::Pipeline::default();
 
-    let child = Command::new("gst-launch-1.0")
-        .arg("-e") // Send EOS on SIGINT
-        .args(&args)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| {
-            format!(
-                "Failed to start gst-launch-1.0: {}. \
-                 Install: sudo apt install gstreamer1.0-tools gstreamer1.0-plugins-good \
-                 gstreamer1.0-plugins-ugly gstreamer1.0-pipewire",
-                e
-            )
-        })?;
+    // ── Video source: PipeWire ──
+    let src = gst::ElementFactory::make("pipewiresrc")
+        .property("fd", config.fd)
+        .property("path", config.node_id.to_string())
+        .property("do-timestamp", true)
+        .property("keepalive-time", 1000i32)
+        .build()
+        .map_err(|e| format!("pipewiresrc: {e}. Install: gstreamer1.0-pipewire"))?;
+
+    // ── Color space conversion ──
+    let convert = gst::ElementFactory::make("videoconvert")
+        .build()
+        .map_err(|e| format!("videoconvert: {e}"))?;
+
+    // ── Region crop (optional) ──
+    let crop = if let Some((x, y, w, h)) = config.region {
+        if let (Some(sw), Some(sh)) = (config.source_width, config.source_height) {
+            let top = y;
+            let left = x;
+            let right = sw as i32 - x - w;
+            let bottom = sh as i32 - y - h;
+            if top >= 0 && left >= 0 && right >= 0 && bottom >= 0 {
+                println!(
+                    "[zureshot-linux] Crop: top={top} left={left} right={right} bottom={bottom} \
+                     (src {}x{}, region {w}x{h}+{x}+{y})",
+                    sw, sh
+                );
+                let elem = gst::ElementFactory::make("videocrop")
+                    .property("top", top)
+                    .property("left", left)
+                    .property("right", right)
+                    .property("bottom", bottom)
+                    .build()
+                    .map_err(|e| format!("videocrop: {e}"))?;
+                Some(elem)
+            } else {
+                println!("[zureshot-linux] Warning: invalid crop margins, skipping crop");
+                None
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    // ── Frame rate control ──
+    let rate = gst::ElementFactory::make("videorate")
+        .build()
+        .map_err(|e| format!("videorate: {e}"))?;
+
+    let caps_filter = gst::ElementFactory::make("capsfilter")
+        .property(
+            "caps",
+            gst::Caps::builder("video/x-raw")
+                .field("framerate", gst::Fraction::new(config.fps, 1))
+                .build(),
+        )
+        .build()
+        .map_err(|e| format!("capsfilter: {e}"))?;
+
+    // ── Video encoder (auto-detect best available) ──
+    let encoder_info = detect_best_encoder();
+    let encoder = build_encoder(&encoder_info, config)?;
+
+    // ── Parser (H.264 or H.265) ──
+    let parser_name = if encoder_info.is_hevc {
+        "h265parse"
+    } else {
+        "h264parse"
+    };
+    let parser = gst::ElementFactory::make(parser_name)
+        .build()
+        .map_err(|e| format!("{parser_name}: {e}"))?;
+
+    // ── MP4 Muxer ──
+    let mux = gst::ElementFactory::make("mp4mux")
+        .name("mux")
+        .property("fragment-duration", 1000u32)
+        .build()
+        .map_err(|e| format!("mp4mux: {e}"))?;
+
+    // ── File sink ──
+    let sink = gst::ElementFactory::make("filesink")
+        .property("location", &config.output_path)
+        .build()
+        .map_err(|e| format!("filesink: {e}"))?;
+
+    // ── Assemble video branch ──
+    // Collect all video elements in order
+    let mut video_elems: Vec<&gst::Element> = vec![&src, &convert];
+    if let Some(ref c) = crop {
+        video_elems.push(c);
+    }
+    video_elems.extend_from_slice(&[&rate, &caps_filter, &encoder, &parser]);
+
+    // Add all video elements to pipeline
+    for elem in &video_elems {
+        pipeline
+            .add(*elem)
+            .map_err(|e| format!("Failed to add video element: {e}"))?;
+    }
+    pipeline
+        .add_many([&mux, &sink])
+        .map_err(|e| format!("Failed to add mux/sink: {e}"))?;
+
+    // Link video chain
+    gst::Element::link_many(video_elems.as_slice())
+        .map_err(|e| format!("Failed to link video chain: {e}"))?;
+
+    // Link parser → mux (video pad)
+    let has_audio = config.capture_system_audio || config.capture_mic;
+    if has_audio {
+        parser
+            .link_pads(Some("src"), &mux, Some("video_%u"))
+            .map_err(|e| format!("Failed to link parser→mux: {e}"))?;
+    } else {
+        parser
+            .link(&mux)
+            .map_err(|e| format!("Failed to link parser→mux: {e}"))?;
+    }
+
+    // Link mux → filesink
+    mux.link(&sink)
+        .map_err(|e| format!("Failed to link mux→sink: {e}"))?;
+
+    // ── Audio branches (optional) ──
+    if config.capture_system_audio {
+        add_audio_branch(&pipeline, &mux, true, "audio_0")?;
+    }
+    if config.capture_mic {
+        let pad_name = if config.capture_system_audio {
+            "audio_1"
+        } else {
+            "audio_0"
+        };
+        add_audio_branch(&pipeline, &mux, false, pad_name)?;
+    }
+
+    // ── Start playing ──
+    pipeline
+        .set_state(gst::State::Playing)
+        .map_err(|e| format!("Failed to start pipeline: {e:?}"))?;
 
     println!(
-        "[zureshot-linux] gst-launch started (PID: {}), recording to: {}",
-        child.id(),
-        config.output_path
+        "[zureshot-linux] Pipeline started: {} @ {}fps {}kbps, encoder={}",
+        config.output_path, config.fps, config.bitrate_kbps, encoder_info.name
     );
 
     Ok(GstPipeline {
-        process: child,
+        pipeline,
         output_path: PathBuf::from(&config.output_path),
+        encoder_info,
     })
 }
 
-/// Build the GStreamer pipeline description string.
-fn build_pipeline_string(config: &PipelineConfig) -> Result<String, String> {
-    let has_audio = config.capture_system_audio || config.capture_mic;
+/// Build the video encoder element with appropriate properties.
+fn build_encoder(info: &EncoderInfo, config: &PipelineConfig) -> Result<gst::Element, String> {
+    let mut builder = gst::ElementFactory::make(info.name);
 
-    // ── Video branch ──
-    let mut video_parts: Vec<String> = Vec::new();
-
-    // PipeWire source
-    video_parts.push(format!(
-        "pipewiresrc path={} do-timestamp=true keepalive-time=1000",
-        config.node_id
-    ));
-
-    // Color space conversion
-    video_parts.push("videoconvert".to_string());
-
-    // Region crop (if specified)
-    if let Some((x, y, w, h)) = config.region {
-        if let (Some(src_w), Some(src_h)) = (config.source_width, config.source_height) {
-            let top = y;
-            let left = x;
-            let right = (src_w as i32) - x - w;
-            let bottom = (src_h as i32) - y - h;
-
-            // Only apply crop if all margins are non-negative
-            if top >= 0 && left >= 0 && right >= 0 && bottom >= 0 {
-                video_parts.push(format!(
-                    "videocrop top={} left={} right={} bottom={}",
-                    top, left, right, bottom
-                ));
-                println!(
-                    "[zureshot-linux] Region crop: top={} left={} right={} bottom={} \
-                     (source {}x{}, region {}x{}+{}+{})",
-                    top, left, right, bottom, src_w, src_h, w, h, x, y
-                );
-            }
+    match info.name {
+        "x264enc" => {
+            builder = builder
+                .property_from_str("speed-preset", "ultrafast")
+                .property_from_str("tune", "zerolatency")
+                .property("bitrate", config.bitrate_kbps as u32)
+                .property("key-int-max", (config.fps * 2) as u32);
         }
-    }
-
-    // Frame rate control
-    video_parts.push("videorate".to_string());
-    video_parts.push(format!("video/x-raw,framerate={}/1", config.fps));
-
-    // H.264 encoding (software, fast preset for real-time)
-    video_parts.push(format!(
-        "x264enc speed-preset=ultrafast tune=zerolatency bitrate={} key-int-max={}",
-        config.bitrate_kbps,
-        config.fps * 2 // Keyframe every 2 seconds
-    ));
-    video_parts.push("video/x-h264,profile=main".to_string());
-    video_parts.push("h264parse".to_string());
-
-    if has_audio {
-        // Connect video to named muxer
-        video_parts.push("mux.video_0".to_string());
-    }
-
-    // ── Audio branches (if requested) ──
-    let mut audio_parts: Vec<String> = Vec::new();
-
-    if config.capture_system_audio {
-        let monitor_device = get_default_monitor_source();
-        let device_arg = match &monitor_device {
-            Some(dev) => format!("pulsesrc device={}", dev),
-            None => "pulsesrc".to_string(),
-        };
-        audio_parts.push(format!(
-            "{} ! audioconvert ! audioresample ! audio/x-raw,rate=48000,channels=2 \
-             ! avenc_aac bitrate=128000 ! aacparse ! mux.audio_0",
-            device_arg
-        ));
-    }
-
-    if config.capture_mic {
-        let audio_idx = if config.capture_system_audio { 1 } else { 0 };
-        audio_parts.push(format!(
-            "pulsesrc ! audioconvert ! audioresample ! audio/x-raw,rate=48000,channels=2 \
-             ! avenc_aac bitrate=128000 ! aacparse ! mux.audio_{}",
-            audio_idx
-        ));
-    }
-
-    // ── Assemble full pipeline ──
-    let mut full_pipeline: Vec<String> = Vec::new();
-
-    // Video branch
-    full_pipeline.push(video_parts.join(" ! "));
-
-    if has_audio {
-        for branch in &audio_parts {
-            full_pipeline.push(branch.clone());
+        "vaapih264enc" | "vaapih265enc" => {
+            builder = builder.property("bitrate", config.bitrate_kbps as u32);
         }
-        // Muxer → file (defined last, GStreamer parser resolves references)
-        full_pipeline.push(format!(
-            "mp4mux name=mux fragment-duration=1000 ! filesink location={}",
-            config.output_path
-        ));
+        "nvh264enc" | "nvh265enc" => {
+            builder = builder.property("bitrate", config.bitrate_kbps as u32);
+        }
+        "x265enc" => {
+            builder = builder
+                .property_from_str("speed-preset", "ultrafast")
+                .property_from_str("tune", "zerolatency")
+                .property("bitrate", config.bitrate_kbps as u32);
+        }
+        _ => {}
+    }
+
+    builder
+        .build()
+        .map_err(|e| format!("Failed to create encoder '{}': {e}", info.name))
+}
+
+/// Add an audio branch to the pipeline and link it to the muxer.
+///
+/// For system audio: uses PulseAudio monitor source (captures desktop audio).
+/// For microphone: uses default PulseAudio input device.
+fn add_audio_branch(
+    pipeline: &gst::Pipeline,
+    mux: &gst::Element,
+    is_system_audio: bool,
+    mux_pad_name: &str,
+) -> Result<(), String> {
+    let label = if is_system_audio {
+        "system audio"
     } else {
-        // No audio: direct mux → file
-        full_pipeline.push(format!(
-            "! mp4mux ! filesink location={}",
-            config.output_path
-        ));
-    }
+        "microphone"
+    };
+    println!("[zureshot-linux] Adding {label} branch → mux.{mux_pad_name}");
 
-    Ok(full_pipeline.join(" "))
+    // Audio source
+    let mut src_builder = gst::ElementFactory::make("pulsesrc");
+    if is_system_audio {
+        if let Some(monitor) = get_default_monitor_source() {
+            src_builder = src_builder.property("device", &monitor);
+        }
+    }
+    let audio_src = src_builder
+        .build()
+        .map_err(|e| format!("pulsesrc ({label}): {e}"))?;
+
+    // Audio processing
+    let audio_convert = gst::ElementFactory::make("audioconvert")
+        .build()
+        .map_err(|e| format!("audioconvert: {e}"))?;
+    let audio_resample = gst::ElementFactory::make("audioresample")
+        .build()
+        .map_err(|e| format!("audioresample: {e}"))?;
+    let audio_caps = gst::ElementFactory::make("capsfilter")
+        .property(
+            "caps",
+            gst::Caps::builder("audio/x-raw")
+                .field("rate", 48000i32)
+                .field("channels", 2i32)
+                .build(),
+        )
+        .build()
+        .map_err(|e| format!("audio capsfilter: {e}"))?;
+
+    // AAC encoder
+    let aac_enc = gst::ElementFactory::make("avenc_aac")
+        .property("bitrate", 128000i32)
+        .build()
+        .map_err(|e| format!("avenc_aac: {e}. Install: gstreamer1.0-libav"))?;
+
+    let aac_parse = gst::ElementFactory::make("aacparse")
+        .build()
+        .map_err(|e| format!("aacparse: {e}"))?;
+
+    // Add all to pipeline
+    pipeline
+        .add_many([
+            &audio_src,
+            &audio_convert,
+            &audio_resample,
+            &audio_caps,
+            &aac_enc,
+            &aac_parse,
+        ])
+        .map_err(|e| format!("Failed to add {label} elements: {e}"))?;
+
+    // Link audio chain
+    gst::Element::link_many([
+        &audio_src,
+        &audio_convert,
+        &audio_resample,
+        &audio_caps,
+        &aac_enc,
+        &aac_parse,
+    ])
+    .map_err(|e| format!("Failed to link {label} chain: {e}"))?;
+
+    // Link to muxer audio pad
+    aac_parse
+        .link_pads(Some("src"), mux, Some(mux_pad_name))
+        .map_err(|e| format!("Failed to link {label}→mux: {e}"))?;
+
+    Ok(())
 }
 
 /// Get the PulseAudio monitor source for the default audio sink.
@@ -235,7 +512,7 @@ fn build_pipeline_string(config: &PipelineConfig) -> Result<String, String> {
 /// On PipeWire (Ubuntu 24.04), `pactl` queries through the PulseAudio
 /// compatibility layer. The monitor source captures system audio output.
 fn get_default_monitor_source() -> Option<String> {
-    let output = Command::new("pactl")
+    let output = std::process::Command::new("pactl")
         .args(["get-default-sink"])
         .output()
         .ok()?;
@@ -249,82 +526,25 @@ fn get_default_monitor_source() -> Option<String> {
         return None;
     }
 
-    let monitor = format!("{}.monitor", sink_name);
-    println!("[zureshot-linux] Default audio monitor: {}", monitor);
+    let monitor = format!("{sink_name}.monitor");
+    println!("[zureshot-linux] Default audio monitor: {monitor}");
     Some(monitor)
 }
 
-/// Concatenate multiple MP4 segments into a single file using ffmpeg.
+/// Compute recording bitrate (kbps) based on resolution, quality, and encoder.
 ///
-/// Used after pause/resume recording to merge segment files.
-/// If there's only one segment, it's simply renamed.
-pub fn concatenate_segments(segments: &[PathBuf], output_path: &str) -> Result<(), String> {
-    if segments.is_empty() {
-        return Err("No segments to concatenate".into());
-    }
-
-    if segments.len() == 1 {
-        std::fs::rename(&segments[0], output_path)
-            .or_else(|_| {
-                // rename may fail across filesystems, fall back to copy
-                std::fs::copy(&segments[0], output_path).map(|_| ()).map_err(|e| e.to_string())
-            })
-            .map_err(|e| format!("Failed to move segment to output: {}", e))?;
-        let _ = std::fs::remove_file(&segments[0]);
-        return Ok(());
-    }
-
-    println!(
-        "[zureshot-linux] Concatenating {} segments into {}",
-        segments.len(),
-        output_path
-    );
-
-    // Create ffmpeg concat file list
-    let list_path = std::env::temp_dir().join("zureshot_concat_list.txt");
-    let list_content: String = segments
-        .iter()
-        .map(|p| format!("file '{}'", p.display()))
-        .collect::<Vec<_>>()
-        .join("\n");
-
-    std::fs::write(&list_path, &list_content)
-        .map_err(|e| format!("Failed to write concat list: {}", e))?;
-
-    let output = Command::new("ffmpeg")
-        .args([
-            "-y",
-            "-f", "concat",
-            "-safe", "0",
-            "-i", &list_path.to_string_lossy(),
-            "-c", "copy",
-            output_path,
-        ])
-        .output()
-        .map_err(|e| format!("ffmpeg concat failed: {}", e))?;
-
-    // Clean up
-    let _ = std::fs::remove_file(&list_path);
-    for seg in segments {
-        let _ = std::fs::remove_file(seg);
-    }
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("ffmpeg concat failed: {}", stderr));
-    }
-
-    println!("[zureshot-linux] Segments concatenated: {}", output_path);
-    Ok(())
-}
-
-/// Compute recording bitrate (kbps) based on resolution and quality.
-///
-/// H.264 software encoding — slightly higher bitrates than macOS HEVC
-/// to compensate for less efficient codec.
-pub fn compute_bitrate(width: u32, height: u32, quality: &RecordingQuality) -> i32 {
+/// Hardware/HEVC encoders are more efficient, so we can use lower bitrates
+/// for the same visual quality compared to x264.
+pub fn compute_bitrate(
+    width: u32,
+    height: u32,
+    quality: &RecordingQuality,
+    encoder: &EncoderInfo,
+) -> i32 {
     let pixels = (width as u64) * (height as u64);
-    match quality {
+
+    // Base bitrates for software H.264
+    let base = match quality {
         RecordingQuality::Standard => {
             if pixels >= 3840 * 2160 {
                 16_000
@@ -347,14 +567,17 @@ pub fn compute_bitrate(width: u32, height: u32, quality: &RecordingQuality) -> i
                 8_000
             }
         }
-    }
-}
+    };
 
-/// Generate a segment file path from the base output path and segment index.
-pub fn segment_path(base_output: &str, index: u32) -> PathBuf {
-    let base = Path::new(base_output);
-    let stem = base.file_stem().unwrap_or_default().to_string_lossy();
-    let ext = base.extension().unwrap_or_default().to_string_lossy();
-    let parent = base.parent().unwrap_or(Path::new("."));
-    parent.join(format!("{}.segment_{:03}.{}", stem, index, ext))
+    // Adjust for encoder efficiency
+    if encoder.is_hevc {
+        // HEVC is ~40% more efficient than H.264
+        (base as f64 * 0.65) as i32
+    } else if encoder.is_hardware {
+        // Hardware H.264 is slightly less efficient than x264 ultrafast
+        // but much faster, so use similar bitrate
+        base
+    } else {
+        base
+    }
 }

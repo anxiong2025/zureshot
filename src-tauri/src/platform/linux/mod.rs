@@ -2,17 +2,19 @@
 //!
 //! Target: Ubuntu 24.04 LTS (Noble) x86_64, Wayland (GNOME) primary.
 //!
-//! Recording architecture:
-//!   XDG Portal ScreenCast → PipeWire node_id
-//!   gst-launch-1.0: pipewiresrc → x264enc → mp4mux → filesink
-//!   Pause/resume: segment-based recording + ffmpeg concatenation
+//! Phase 2.5 architecture (pure Rust, in-process):
+//!   ashpd (D-Bus) → XDG Portal ScreenCast → PipeWire fd + node_id
+//!   gstreamer-rs  → in-process pipeline: pipewiresrc → encoder → mp4mux → filesink
+//!   Pause/resume: GstPipeline PAUSED ↔ PLAYING (no segments, no ffmpeg)
+//!   Encoding: auto-detect VA-API/NVENC hardware, fallback to x264
 
 pub mod capture;
 pub mod portal;
 pub mod writer;
 
+use std::os::fd::AsRawFd;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use tauri::AppHandle;
@@ -23,28 +25,22 @@ use super::{RecordingQuality, StartRecordingConfig};
 
 /// Owns all Linux-specific recording state.
 ///
-/// Created by `start_recording()`. The handle is stored in `RecordingState`
-/// behind an external `Mutex`, so all methods take `&self` and use interior
-/// mutability where needed.
+/// Phase 2.5: dramatically simplified vs Phase 2.
+///   - No segment files, no segment counter, no ffmpeg concatenation
+///   - Pause/resume via GStreamer native state changes
+///   - Portal session kept alive via ashpd + tokio runtime
+///
+/// Created by `start_recording()`. Stored in `RecordingState` behind
+/// an external `Mutex`, so methods take `&self` with interior mutability.
 pub struct RecordingHandle {
-    /// Active GStreamer pipeline (None if paused or stopped).
+    /// In-process GStreamer pipeline (None if stopped).
     pipeline: Mutex<Option<writer::GstPipeline>>,
-    /// XDG Portal session info.
-    session: portal::ScreencastSession,
-    /// Completed segment files (for pause/resume concatenation).
-    segments: Mutex<Vec<PathBuf>>,
-    /// Counter for generating unique segment filenames.
-    segment_counter: AtomicU32,
+    /// XDG Portal session (keeps PipeWire stream alive).
+    session: Mutex<Option<portal::ScreencastSession>>,
     /// Shared paused flag.
     paused_flag: Arc<AtomicBool>,
     /// Final output file path.
     output_path: String,
-    /// Recording parameters (needed to restart pipeline on resume).
-    fps: i32,
-    bitrate_kbps: i32,
-    region: Option<(i32, i32, i32, i32)>,
-    capture_system_audio: bool,
-    capture_microphone: bool,
 }
 
 // SAFETY: All interior state is behind Mutex or atomic types.
@@ -52,92 +48,62 @@ unsafe impl Send for RecordingHandle {}
 unsafe impl Sync for RecordingHandle {}
 
 impl RecordingHandle {
-    /// Stop the recording pipeline (sends SIGINT → EOS → clean MP4).
+    /// Stop the recording pipeline (sends EOS → clean MP4).
     pub fn stop_capture(&self) {
         println!("[zureshot-linux] Stopping capture...");
         let mut pipeline_guard = self.pipeline.lock().unwrap();
-        if let Some(ref mut pipeline) = *pipeline_guard {
+        if let Some(ref pipeline) = *pipeline_guard {
             if let Err(e) = pipeline.stop() {
-                println!("[zureshot-linux] Warning: stop error: {}", e);
-            }
-            // Save this segment
-            let seg_path = pipeline.output_path().to_path_buf();
-            if seg_path.exists() {
-                self.segments.lock().unwrap().push(seg_path);
+                println!("[zureshot-linux] Warning: stop error: {e}");
             }
         }
         *pipeline_guard = None;
         println!("[zureshot-linux] Capture stopped");
     }
 
-    /// Finalize the output file: concatenate segments, close portal session.
+    /// Finalize the output file: close portal session, release PipeWire.
     pub fn finalize(&self) {
-        println!("[zureshot-linux] Finalizing recording...");
-
-        // Concatenate segments into the final output
-        let segments = self.segments.lock().unwrap();
-        if !segments.is_empty() {
-            match writer::concatenate_segments(&segments, &self.output_path) {
-                Ok(()) => println!("[zureshot-linux] Finalized: {}", self.output_path),
-                Err(e) => println!("[zureshot-linux] Finalize error: {}", e),
-            }
-        }
+        println!("[zureshot-linux] Finalizing recording: {}", self.output_path);
 
         // Close the portal session (releases PipeWire stream)
-        portal::close_session(&self.session.session_handle);
+        let session = self.session.lock().unwrap().take();
+        if let Some(session) = session {
+            session.close();
+        }
+
+        println!("[zureshot-linux] Recording finalized: {}", self.output_path);
     }
 
-    /// Pause recording: stop current GStreamer pipeline (saves segment).
+    /// Pause recording: GStreamer pipeline PLAYING → PAUSED.
     ///
-    /// The portal session stays open so the PipeWire node remains valid.
-    /// On resume, a new gst-launch process connects to the same node.
+    /// Instant — no segment files, no subprocess teardown.
     pub fn pause(&self) {
         self.paused_flag.store(true, Ordering::Relaxed);
         println!("[zureshot-linux] Pausing recording...");
 
-        let mut pipeline_guard = self.pipeline.lock().unwrap();
-        if let Some(ref mut pipeline) = *pipeline_guard {
-            if let Err(e) = pipeline.stop() {
-                println!("[zureshot-linux] Warning: pause stop error: {}", e);
-            }
-            let seg_path = pipeline.output_path().to_path_buf();
-            if seg_path.exists() {
-                self.segments.lock().unwrap().push(seg_path);
+        let pipeline_guard = self.pipeline.lock().unwrap();
+        if let Some(ref pipeline) = *pipeline_guard {
+            if let Err(e) = pipeline.pause() {
+                println!("[zureshot-linux] Warning: pause error: {e}");
             }
         }
-        *pipeline_guard = None;
-        println!("[zureshot-linux] Recording paused (segment saved)");
+        println!("[zureshot-linux] Recording paused");
     }
 
-    /// Resume recording: start a new GStreamer pipeline (new segment).
+    /// Resume recording: GStreamer pipeline PAUSED → PLAYING.
+    ///
+    /// Instant — no new subprocess, no new segment file.
     pub fn resume(&self) {
         self.paused_flag.store(false, Ordering::Relaxed);
         println!("[zureshot-linux] Resuming recording...");
 
-        let seg_idx = self.segment_counter.fetch_add(1, Ordering::Relaxed);
-        let seg_output = writer::segment_path(&self.output_path, seg_idx);
-
-        let config = writer::PipelineConfig {
-            node_id: self.session.node_id,
-            output_path: seg_output.to_string_lossy().to_string(),
-            fps: self.fps,
-            bitrate_kbps: self.bitrate_kbps,
-            source_width: self.session.width,
-            source_height: self.session.height,
-            region: self.region,
-            capture_system_audio: self.capture_system_audio,
-            capture_mic: self.capture_microphone,
-        };
-
-        match writer::start_pipeline(&config) {
-            Ok(pipeline) => {
-                *self.pipeline.lock().unwrap() = Some(pipeline);
-                println!("[zureshot-linux] Recording resumed (new segment)");
-            }
-            Err(e) => {
-                println!("[zureshot-linux] Failed to resume: {}", e);
+        let pipeline_guard = self.pipeline.lock().unwrap();
+        if let Some(ref pipeline) = *pipeline_guard {
+            if let Err(e) = pipeline.resume() {
+                println!("[zureshot-linux] Warning: resume error: {e}");
             }
         }
+        println!("[zureshot-linux] Recording resumed");
     }
 
     /// Refresh window exclusion filter (no-op on Linux — Portal handles this).
@@ -150,7 +116,7 @@ impl RecordingHandle {
 
 /// Set up the capture pipeline and begin recording.
 ///
-/// Flow: XDG Portal → PipeWire node_id → gst-launch-1.0 pipeline
+/// Flow: ashpd → XDG Portal → PipeWire fd + node_id → GStreamer pipeline
 pub fn start_recording(
     _app: &AppHandle,
     config: StartRecordingConfig,
@@ -161,7 +127,7 @@ pub fn start_recording(
         config.capture_system_audio, config.capture_microphone
     );
 
-    // ── Step 1: Request screen capture via XDG Portal ──
+    // ── Step 1: Request screen capture via XDG Portal (ashpd) ──
     // TODO: store and reuse restore_token across sessions
     let session = portal::request_screencast(None)?;
 
@@ -175,27 +141,28 @@ pub fn start_recording(
     let src_width = session.width.unwrap_or(1920);
     let src_height = session.height.unwrap_or(1080);
 
-    // Region crop (convert CSS pixels to capture pixels)
-    // For MVP, assume 1:1 scaling. HiDPI adjustment can be added in Phase 3.
+    // Region crop
     let region = config.region.as_ref().map(|r| {
         (r.x as i32, r.y as i32, r.width as i32, r.height as i32)
     });
 
-    // Compute bitrate based on output dimensions
+    // Compute output dimensions and bitrate
     let (out_w, out_h) = if let Some((_, _, w, h)) = region {
         (w as u32, h as u32)
     } else {
         (src_width, src_height)
     };
-    let bitrate_kbps = writer::compute_bitrate(out_w, out_h, &config.quality);
 
-    // ── Step 3: Start GStreamer pipeline ──
-    let seg_idx = 0u32;
-    let seg_output = writer::segment_path(&config.output_path, seg_idx);
+    // Detect best encoder for adaptive bitrate
+    gstreamer::init().map_err(|e| format!("GStreamer init: {e}"))?;
+    let encoder_info = writer::detect_best_encoder();
+    let bitrate_kbps = writer::compute_bitrate(out_w, out_h, &config.quality, &encoder_info);
 
+    // ── Step 3: Start in-process GStreamer pipeline ──
     let pipeline_config = writer::PipelineConfig {
         node_id: session.node_id,
-        output_path: seg_output.to_string_lossy().to_string(),
+        fd: session.fd.as_raw_fd(),
+        output_path: config.output_path.clone(),
         fps,
         bitrate_kbps,
         source_width: Some(src_width),
@@ -208,22 +175,17 @@ pub fn start_recording(
     let pipeline = writer::start_pipeline(&pipeline_config)?;
 
     println!(
-        "[zureshot-linux] Recording started: {}x{} @ {}fps, {}kbps, node={}",
-        out_w, out_h, fps, bitrate_kbps, session.node_id
+        "[zureshot-linux] Recording started: {}x{} @ {}fps, {}kbps, encoder={} ({}), node={}",
+        out_w, out_h, fps, bitrate_kbps,
+        encoder_info.name, encoder_info.description,
+        session.node_id
     );
 
     Ok(RecordingHandle {
         pipeline: Mutex::new(Some(pipeline)),
-        session,
-        segments: Mutex::new(Vec::new()),
-        segment_counter: AtomicU32::new(seg_idx + 1),
+        session: Mutex::new(Some(session)),
         paused_flag: Arc::new(AtomicBool::new(false)),
         output_path: config.output_path,
-        fps,
-        bitrate_kbps,
-        region,
-        capture_system_audio: config.capture_system_audio,
-        capture_microphone: config.capture_microphone,
     })
 }
 
@@ -242,8 +204,6 @@ pub fn take_screenshot_region(
 
 /// Reveal a file in the default file manager.
 pub fn reveal_file(path: &str) -> Result<(), String> {
-    // xdg-open opens the parent directory; there's no standard "select file"
-    // equivalent across all Linux file managers.
     let parent = std::path::Path::new(path)
         .parent()
         .map(|p| p.to_string_lossy().to_string())
@@ -252,7 +212,7 @@ pub fn reveal_file(path: &str) -> Result<(), String> {
     std::process::Command::new("xdg-open")
         .arg(&parent)
         .spawn()
-        .map_err(|e| format!("Failed to open file manager: {}", e))?;
+        .map_err(|e| format!("Failed to open file manager: {e}"))?;
     Ok(())
 }
 
@@ -267,30 +227,28 @@ pub fn copy_image_to_clipboard(path: &str) -> Result<(), String> {
     match wl_result {
         Ok(mut child) => {
             let file_bytes = std::fs::read(path)
-                .map_err(|e| format!("Failed to read image file: {}", e))?;
+                .map_err(|e| format!("Failed to read image file: {e}"))?;
             if let Some(ref mut stdin) = child.stdin {
                 use std::io::Write;
                 stdin
                     .write_all(&file_bytes)
-                    .map_err(|e| format!("Failed to write to wl-copy: {}", e))?;
+                    .map_err(|e| format!("Failed to write to wl-copy: {e}"))?;
             }
             let status = child
                 .wait()
-                .map_err(|e| format!("wl-copy failed: {}", e))?;
+                .map_err(|e| format!("wl-copy failed: {e}"))?;
             if status.success() {
                 return Ok(());
             }
         }
-        Err(_) => {
-            // wl-copy not found, try xclip
-        }
+        Err(_) => {}
     }
 
     // Fallback: xclip (X11)
     let output = std::process::Command::new("xclip")
         .args(["-selection", "clipboard", "-target", "image/png", "-i", path])
         .output()
-        .map_err(|e| format!("Neither wl-copy nor xclip available: {}", e))?;
+        .map_err(|e| format!("Neither wl-copy nor xclip available: {e}"))?;
 
     if !output.status.success() {
         return Err(format!(
@@ -306,14 +264,10 @@ pub fn show_confirm_dialog(title: &str, message: &str, accept: &str, cancel: &st
     let result = std::process::Command::new("zenity")
         .args([
             "--question",
-            "--title",
-            title,
-            "--text",
-            message,
-            "--ok-label",
-            accept,
-            "--cancel-label",
-            cancel,
+            "--title", title,
+            "--text", message,
+            "--ok-label", accept,
+            "--cancel-label", cancel,
         ])
         .output();
 
@@ -323,14 +277,10 @@ pub fn show_confirm_dialog(title: &str, message: &str, accept: &str, cancel: &st
             // zenity not available — try kdialog
             std::process::Command::new("kdialog")
                 .args([
-                    "--title",
-                    title,
-                    "--yesno",
-                    message,
-                    "--yes-label",
-                    accept,
-                    "--no-label",
-                    cancel,
+                    "--title", title,
+                    "--yesno", message,
+                    "--yes-label", accept,
+                    "--no-label", cancel,
                 ])
                 .output()
                 .map(|o| o.status.success())
@@ -346,7 +296,6 @@ pub fn show_info_dialog(title: &str, message: &str) {
         .output();
 
     if result.is_err() {
-        // Fallback to kdialog
         let _ = std::process::Command::new("kdialog")
             .args(["--title", title, "--msgbox", message])
             .output();
@@ -358,7 +307,7 @@ pub fn open_folder(path: &str) -> Result<(), String> {
     std::process::Command::new("xdg-open")
         .arg(path)
         .spawn()
-        .map_err(|e| format!("Failed to open folder: {}", e))?;
+        .map_err(|e| format!("Failed to open folder: {e}"))?;
     Ok(())
 }
 
@@ -382,8 +331,6 @@ pub fn set_autostart_enabled(enabled: bool) {
         let dir = path.parent().unwrap();
         let _ = std::fs::create_dir_all(dir);
 
-        // Determine the executable path. In production (.deb / AppImage),
-        // the binary is usually at /usr/bin/zureshot or similar.
         let exec = std::env::current_exe()
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or_else(|_| "zureshot".to_string());
@@ -402,13 +349,13 @@ pub fn set_autostart_enabled(enabled: bool) {
         );
         match std::fs::write(&path, content) {
             Ok(()) => println!("[zureshot-linux] Autostart enabled: {}", path.display()),
-            Err(e) => eprintln!("[zureshot-linux] Failed to write autostart file: {}", e),
+            Err(e) => eprintln!("[zureshot-linux] Failed to write autostart file: {e}"),
         }
     } else {
         match std::fs::remove_file(&path) {
             Ok(()) => println!("[zureshot-linux] Autostart disabled"),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => eprintln!("[zureshot-linux] Failed to remove autostart file: {}", e),
+            Err(e) => eprintln!("[zureshot-linux] Failed to remove autostart file: {e}"),
         }
     }
 }
@@ -416,9 +363,6 @@ pub fn set_autostart_enabled(enabled: bool) {
 // ── First-run permission guide ───────────────────────────────────────
 
 /// Show a first-run dialog explaining Linux screen capture permissions.
-///
-/// On Linux, every recording/screenshot triggers a system Portal dialog
-/// the first time. This guide helps set user expectations.
 pub fn show_first_run_guide() {
     show_info_dialog(
         "Welcome to Zureshot",

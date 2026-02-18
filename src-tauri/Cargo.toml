@@ -39,13 +39,10 @@ objc2-core-foundation = "0.3"
 block2 = "0.6"
 dispatch2 = "0.3"
 
-# ── Linux dependencies (Phase 2: uncomment when implementing recording) ──
-# [target.'cfg(target_os = "linux")'.dependencies]
-# zbus = "4"
-# gstreamer = "0.23"
-# gstreamer-app = "0.23"
-# gstreamer-video = "0.23"
-# image = "0.25"
+# ── Linux dependencies (Phase 2.5: pure Rust D-Bus + in-process GStreamer) ──
+[target.'cfg(target_os = "linux")'.dependencies]
+ashpd = { version = "0.10", default-features = false, features = ["tokio"] }
+gstreamer = "0.23"
 
 [features]
 default = ["custom-protocol"]

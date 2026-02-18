@@ -88,7 +88,9 @@ jobs:
             libxcomposite-dev \
             libxdamage-dev \
             libxext-dev \
-            libxfixes-dev
+            libxfixes-dev \
+            libgstreamer1.0-dev \
+            libgstreamer-plugins-base1.0-dev
 
       - run: pnpm install
 

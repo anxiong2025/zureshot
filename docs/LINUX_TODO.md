@@ -291,25 +291,27 @@ image = "0.25"
 | 暂停/恢复 | 停进程 + ffmpeg 段拼接 | GstPipeline 状态切换 PAUSED↔PLAYING | 无段文件 IO，无拼接开销，瞬间暂停 |
 | 帧捕获 | 依赖 GStreamer pipewiresrc | `pipewire` crate 直接读帧 | 更精细的帧控制和时间戳管理 |
 
-- [ ] **2.5.1** 替换 Portal 交互：python3 子进程 → `zbus` crate 纯 Rust D-Bus 通信
-- [ ] **2.5.2** 替换 GStreamer 集成：gst-launch-1.0 子进程 → `gstreamer-rs` 进程内管线
-- [ ] **2.5.3** 硬件编码支持：检测 VA-API/NVENC → 优先硬件编码，fallback 到 x264
-- [ ] **2.5.4** HEVC (H.265) 编码：vaapih265enc / nvh265enc，对标 macOS VideoToolbox HEVC
-- [ ] **2.5.5** 管线内暂停/恢复：GstPipeline PAUSED↔PLAYING 状态切换，移除段拼接
-- [ ] **2.5.6** PipeWire 直接集成：`pipewire` crate 替代 pipewiresrc，精细帧控制
-- [ ] **2.5.7** 零拷贝优化：DMA-BUF 共享内存，避免 GPU→CPU→GPU 拷贝
-- [ ] **2.5.8** 自适应编码器选择：运行时探测硬件能力，自动选择最优编码路径
-- [ ] **2.5.9** 性能基准测试：CPU 占用、内存、帧率、文件大小 vs macOS 版对比
-- [ ] **2.5.10** Cargo.toml 更新：添加 Linux-only crate 条件依赖（zbus, gstreamer-rs, pipewire）
+- [x] **2.5.1** 替换 Portal 交互：python3 子进程 → `ashpd` crate 纯 Rust D-Bus 通信（含 tokio runtime 保活）
+- [x] **2.5.2** 替换 GStreamer 集成：gst-launch-1.0 子进程 → `gstreamer-rs` 进程内管线
+- [x] **2.5.3** 硬件编码支持：检测 VA-API/NVENC → 优先硬件编码，fallback 到 x264
+- [x] **2.5.4** HEVC (H.265) 编码：vaapih265enc / nvh265enc，对标 macOS VideoToolbox HEVC
+- [x] **2.5.5** 管线内暂停/恢复：GstPipeline PAUSED↔PLAYING 状态切换，移除段拼接
+- [ ] **2.5.6** PipeWire 直接集成：`pipewire` crate 替代 pipewiresrc（延后，pipewiresrc 已足够好）
+- [ ] **2.5.7** 零拷贝优化：DMA-BUF 共享内存（延后，需实机验证）
+- [x] **2.5.8** 自适应编码器选择：运行时探测硬件能力，自动选择最优编码路径
+- [ ] **2.5.9** 性能基准测试：CPU 占用、内存、帧率、文件大小 vs macOS 版对比（待实机）
+- [x] **2.5.10** Cargo.toml 更新：添加 Linux-only crate 条件依赖（ashpd, gstreamer）
 
-**新增 Rust crate 依赖（仅 Linux）：**
+**实际使用的 Rust crate 依赖（仅 Linux）：**
 ```toml
 [target.'cfg(target_os = "linux")'.dependencies]
-zbus = "4"                    # D-Bus 通信（替代 python3-dbus）
-gstreamer = "0.23"            # GStreamer Rust 绑定
-gstreamer-app = "0.23"        # GStreamer appsrc/appsink
-gstreamer-video = "0.23"      # GStreamer 视频处理
-pipewire = "0.8"              # PipeWire 直接集成
+ashpd = { version = "0.10", default-features = false, features = ["tokio"] }  # XDG Portal（含 zbus）
+gstreamer = "0.23"            # GStreamer 进程内管线
+```
+
+**延后的 crate（需实机验证后决定是否添加）：**
+```toml
+# pipewire = "0.8"            # PipeWire 直接集成（pipewiresrc 已足够好）
 ```
 
 > ⚠️ 这些 crate 是 Linux-only 的，CI 的 Ubuntu job 需要安装对应 -dev 包。
@@ -356,7 +358,7 @@ pipewire = "0.8"              # PipeWire 直接集成
 |------|---------|---------|---------|------|
 | Phase 1 (构建+截屏) | ~600 行 Rust + ~100 行 YAML | ~300 行重构 | 3-5 天 → 实际 2 天 | ✅ 完成 |
 | Phase 2 (录屏 MVP) | ~860 行 Rust | ~30 行修改 | 5-7 天 → 实际 1 天 | ✅ 代码完成 |
-| Phase 2.5 (性能优化) | ~1200-1500 行 Rust | ~800 行重写 | 5-8 天 | ⬜ 计划中 |
+| Phase 2.5 (性能优化) | ~800 行 Rust (重写) | ~400 行删除 | 5-8 天 → 实际 1 天 | ✅ 代码完成 |
 | Phase 3 (完善体验) | ~200 行 Rust + 文档 | ~100 行微调 | 2-3 天 | ✅ 代码完成 |
 | **合计** | **~2900-3300 行新代码** | **~1230 行重构** | **15-23 天** |
 
