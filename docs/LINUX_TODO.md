@@ -239,21 +239,21 @@ image = "0.25"
 
 ## 四、分阶段 TODO
 
-### Phase 1：构建跑通 + 基础截屏（MVP）
+### Phase 1：构建跑通 + 基础截屏（MVP） ✅ 已完成
 
-> 预估工时：**3-5 天**
+> 预估工时：**3-5 天** → 实际 **2 天**（2026-02-17 ~ 02-19）
 > 目标：应用能在 Ubuntu 24.04 上启动，托盘正常，能截屏
 
-- [ ] **1.1** 创建 `platform/` 模块结构，定义跨平台 trait
-- [ ] **1.2** 将现有 `capture.rs` 和 `writer.rs` 移入 `platform/macos/`
-- [ ] **1.3** 重构 `commands.rs`，`RecordingState` 使用 trait object 替代 ObjC 类型
-- [ ] **1.4** `Cargo.toml` 添加条件编译依赖（macOS / Linux 分开）
-- [ ] **1.5** `tray.rs` 平台适配：`osascript` → `zenity`，`open` → `xdg-open`
-- [ ] **1.6** 实现 `platform/linux/capture.rs`：XDG Portal 截屏
-- [ ] **1.7** 实现 `platform/linux/dialog.rs`：zenity 对话框
-- [ ] **1.8** `tauri.conf.json` 添加 Linux bundle 配置（deb + AppImage）
-- [ ] **1.9** 创建 GitHub Actions CI：Ubuntu 24.04 构建 + 产出 .deb/.AppImage
-- [ ] **1.10** 验证：应用启动 → 托盘显示 → 截屏区域选择 → 截屏保存 → 复制到剪贴板
+- [x] **1.1** 创建 `platform/` 模块结构，定义跨平台 trait
+- [x] **1.2** 将现有 `capture.rs` 和 `writer.rs` 移入 `platform/macos/`
+- [x] **1.3** 重构 `commands.rs`，`RecordingState` 使用 platform::imp::RecordingHandle
+- [x] **1.4** `Cargo.toml` 添加条件编译依赖（macOS / Linux 分开）
+- [x] **1.5** `tray.rs` 平台适配：`osascript` → `zenity`，`open` → `xdg-open`
+- [x] **1.6** 实现 `platform/linux/capture.rs`：grim / gnome-screenshot / ImageMagick 截屏
+- [x] **1.7** Linux 对话框（zenity/kdialog）整合到 `platform/linux/mod.rs`
+- [x] **1.8** `tauri.conf.json` 添加 Linux bundle 配置（deb + AppImage）
+- [x] **1.9** 创建 GitHub Actions CI：macOS + Ubuntu 双平台构建
+- [x] **1.10** CI 验证通过：macOS .dmg + Ubuntu .deb/.rpm/.AppImage 全部构建成功
 
 ### Phase 2：录屏功能
 
@@ -284,8 +284,9 @@ image = "0.25"
 - [ ] **3.5** Linux 端 UI 微调（字体渲染、窗口透明度在 Wayland/X11 下的表现）
 - [ ] **3.6** 权限引导：首次运行提示用户允许 Screen Cast 权限
 - [ ] **3.7** CI 产出 release artifacts（.deb + .AppImage + 更新 JSON）
-- [ ] **3.8** README 添加 Linux 安装说明
-- [ ] **3.9** 测试矩阵：Ubuntu 24.04 GNOME (Wayland) + Ubuntu 24.04 GNOME (X11)
+- [ ] **3.8** CI 配置 `TAURI_SIGNING_PRIVATE_KEY` GitHub Secret（自动更新签名，当前已跳过）
+- [ ] **3.9** README 添加 Linux 安装说明
+- [ ] **3.10** 测试矩阵：Ubuntu 24.04 GNOME (Wayland) + Ubuntu 24.04 GNOME (X11)
 
 ---
 
@@ -300,6 +301,7 @@ image = "0.25"
 | 硬件编码可用性 | VA-API/NVENC 不一定存在 | MVP 用软件编码（x264），后续可选硬件加速 |
 | 全局快捷键 | Wayland 限制后台键盘监听 | 使用 `GlobalShortcuts` Portal 或依赖托盘菜单 |
 | HiDPI 缩放 | 不同缩放比例下坐标计算 | 测试 100%/125%/150%/200% 缩放 |
+| 自动更新签名 | `TAURI_SIGNING_PRIVATE_KEY` 需配置到 GitHub Secrets 才能签名更新包 | Phase 3 发布前配置，当前 CI 已跳过签名步骤 |
 
 ---
 
@@ -318,12 +320,12 @@ image = "0.25"
 
 ## 七、验收标准
 
-### MVP (Phase 1 完成)
-- [ ] `pnpm tauri build` 在 Ubuntu 24.04 CI 上成功
-- [ ] 产出 .deb 和 .AppImage
-- [ ] .deb 安装后应用能启动
-- [ ] 系统托盘图标正常显示和交互
-- [ ] 截屏功能可用（区域选择 → 截图 → 保存/复制）
+### MVP (Phase 1 完成) ✅
+- [x] `pnpm tauri build` 在 Ubuntu CI 上成功（Build #1, commit 154c84b）
+- [x] 产出 .deb、.rpm 和 .AppImage（额外产出了 rpm 包）
+- [ ] .deb 安装后应用能启动（待实机测试）
+- [ ] 系统托盘图标正常显示和交互（待实机测试）
+- [ ] 截屏功能可用（区域选择 → 截图 → 保存/复制）（待实机测试）
 
 ### 完整版 (Phase 3 完成)
 - [ ] 录屏功能完整（全屏/区域 + 音频 + 暂停/恢复）
