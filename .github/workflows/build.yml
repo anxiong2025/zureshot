@@ -32,7 +32,16 @@ jobs:
       - run: pnpm install
 
       - name: Build Tauri app (macOS)
-        run: pnpm tauri build
+        run: |
+          if [ -z "$TAURI_SIGNING_PRIVATE_KEY" ]; then
+            echo "No signing key found, building without updater artifacts"
+            pnpm tauri build --config '{"bundle":{"createUpdaterArtifacts":false}}'
+          else
+            pnpm tauri build
+          fi
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
 
       - name: Upload macOS artifacts
         uses: actions/upload-artifact@v4
@@ -84,7 +93,16 @@ jobs:
       - run: pnpm install
 
       - name: Build Tauri app (Linux)
-        run: pnpm tauri build
+        run: |
+          if [ -z "$TAURI_SIGNING_PRIVATE_KEY" ]; then
+            echo "No signing key found, building without updater artifacts"
+            pnpm tauri build --config '{"bundle":{"createUpdaterArtifacts":false}}'
+          else
+            pnpm tauri build
+          fi
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
 
       - name: Upload Linux artifacts
         uses: actions/upload-artifact@v4

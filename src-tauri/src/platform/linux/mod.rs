@@ -17,7 +17,7 @@ use std::sync::{Arc, Mutex};
 
 use tauri::AppHandle;
 
-use super::{CaptureRegion, RecordingQuality, StartRecordingConfig};
+use super::{RecordingQuality, StartRecordingConfig};
 
 // ── RecordingHandle ──────────────────────────────────────────────────
 

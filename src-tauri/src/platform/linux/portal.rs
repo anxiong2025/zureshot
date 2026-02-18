@@ -21,6 +21,7 @@ pub struct ScreencastSession {
     /// Session handle (D-Bus object path) — needed to close the session.
     pub session_handle: String,
     /// Restore token — can be used to skip the permission dialog next time.
+    #[allow(dead_code)]
     pub restore_token: String,
     /// Captured stream width (if reported by portal).
     pub width: Option<u32>,
