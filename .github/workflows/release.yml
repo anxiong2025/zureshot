@@ -5,10 +5,11 @@ on:
     tags:
       - 'v*'
 
+permissions:
+  contents: write
+
 jobs:
   release:
-    permissions:
-      contents: write
     strategy:
       fail-fast: false
       matrix:
@@ -21,6 +22,10 @@ jobs:
           - platform: macos-latest
             args: '--target x86_64-apple-darwin'
             target: x86_64-apple-darwin
+          # Linux x86_64
+          - platform: ubuntu-22.04
+            args: ''
+            target: ''
 
     runs-on: ${{ matrix.platform }}
     steps:
@@ -29,22 +34,39 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: lts/*
+          node-version: 22
 
       - name: Install pnpm
         uses: pnpm/action-setup@v4
         with:
-          version: 8
+          version: latest
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.target }}
+          targets: ${{ matrix.target || '' }}
 
       - name: Rust cache
         uses: swatinem/rust-cache@v2
         with:
           workspaces: './src-tauri -> target'
+
+      - name: Install Linux system dependencies
+        if: matrix.platform == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libappindicator3-dev \
+            librsvg2-dev \
+            patchelf \
+            libxdo-dev \
+            libx11-dev \
+            libxrandr-dev \
+            libxcomposite-dev \
+            libxdamage-dev \
+            libxext-dev \
+            libxfixes-dev
 
       - name: Install frontend dependencies
         run: pnpm install
@@ -60,14 +82,21 @@ jobs:
           releaseName: 'Zureshot v__VERSION__'
           releaseBody: |
             ### 📥 Download & Install
+
+            **macOS:**
             Download the `.dmg` for your Mac, open it and drag Zureshot into Applications.
             - **Apple Silicon (M1/M2/M3/M4):** `Zureshot_*_aarch64.dmg`
             - **Intel Mac:** `Zureshot_*_x64.dmg`
 
-            ### 🔄 Update
-            If you already have Zureshot installed, the app will automatically detect and prompt you to update.
+            **Linux (Ubuntu 24.04+):**
+            - **Debian/Ubuntu:** Download `.deb` and install with `sudo dpkg -i Zureshot_*.deb`
+            - **AppImage:** Download `.AppImage`, make executable with `chmod +x`, and run
 
-            > ⚠️ macOS may show "unverified developer" warning. Go to **System Settings → Privacy & Security** and click **Open Anyway**.
+            ### 🔄 Update
+            Zureshot auto-checks for updates. You can also check manually from the tray menu.
+
+            > ⚠️ **macOS:** May show "unverified developer" warning. Go to **System Settings → Privacy & Security** and click **Open Anyway**.
+            > ⚠️ **Linux:** Screen recording requires PipeWire and XDG Desktop Portal. See README for details.
           releaseDraft: true
           prerelease: false
           args: ${{ matrix.args }}

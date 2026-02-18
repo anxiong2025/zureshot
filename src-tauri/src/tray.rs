@@ -111,6 +111,26 @@ fn set_auto_update_enabled(app: &AppHandle, enabled: bool) {
     let _ = std::fs::write(&path, serde_json::to_string_pretty(&settings).unwrap());
 }
 
+fn is_first_run(app: &AppHandle) -> bool {
+    let path = settings_path(app);
+    let done = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        .and_then(|v| v["first_run_done"].as_bool())
+        .unwrap_or(false);
+    !done
+}
+
+fn mark_first_run_done(app: &AppHandle) {
+    let path = settings_path(app);
+    let mut settings: serde_json::Value = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
+    settings["first_run_done"] = serde_json::json!(true);
+    let _ = std::fs::write(&path, serde_json::to_string_pretty(&settings).unwrap());
+}
+
 // ── Native dialogs (delegated to platform layer) ────────────────────
 
 fn show_confirm_dialog(title: &str, message: &str, accept: &str, cancel: &str) -> bool {
@@ -169,6 +189,14 @@ fn build_menu(app: &AppHandle, is_recording: bool) -> Result<Menu<tauri::Wry>, B
         get_auto_update_enabled(app),
         None::<&str>,
     )?;
+    let launch_at_login = CheckMenuItem::with_id(
+        app,
+        "launch_at_login",
+        "Launch at Login",
+        true,
+        crate::platform::imp::get_autostart_enabled(),
+        None::<&str>,
+    )?;
     let separator2 = MenuItem::with_id(app, "sep2", "────────────", false, None::<&str>)?;
     let quit = MenuItem::with_id(app, "quit", "Quit Zureshot", true, Some("CmdOrCtrl+Q"))?;
 
@@ -182,6 +210,7 @@ fn build_menu(app: &AppHandle, is_recording: bool) -> Result<Menu<tauri::Wry>, B
             &open_recordings,
             &check_update,
             &auto_update,
+            &launch_at_login,
             &separator2,
             &quit,
         ],
@@ -204,6 +233,16 @@ pub fn setup_tray(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
             handle_menu_event(app, event.id.as_ref());
         })
         .build(app)?;
+
+    // Show first-run permission guide (Linux only — macOS uses system dialogs)
+    if is_first_run(app) {
+        mark_first_run_done(app);
+        let app_clone = app.clone();
+        std::thread::spawn(move || {
+            crate::platform::imp::show_first_run_guide();
+            let _ = &app_clone; // prevent drop until guide is dismissed
+        });
+    }
 
     Ok(())
 }
@@ -411,6 +450,21 @@ fn handle_menu_event(app: &AppHandle, id: &str) {
             set_auto_update_enabled(app, new_val);
             println!(
                 "[zureshot] Auto-update check {}",
+                if new_val { "enabled" } else { "disabled" }
+            );
+            // Rebuild menu so the checkmark reflects the new state
+            let is_recording = {
+                let state = app.state::<Mutex<RecordingState>>();
+                state.lock().map(|r| r.is_recording).unwrap_or(false)
+            };
+            update_menu_state(app, is_recording);
+        }
+        "launch_at_login" => {
+            let current = crate::platform::imp::get_autostart_enabled();
+            let new_val = !current;
+            crate::platform::imp::set_autostart_enabled(new_val);
+            println!(
+                "[zureshot] Launch at login {}",
                 if new_val { "enabled" } else { "disabled" }
             );
             // Rebuild menu so the checkmark reflects the new state

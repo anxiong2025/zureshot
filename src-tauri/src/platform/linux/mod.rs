@@ -361,3 +361,72 @@ pub fn open_folder(path: &str) -> Result<(), String> {
         .map_err(|e| format!("Failed to open folder: {}", e))?;
     Ok(())
 }
+
+// ── Autostart (Launch at Login) ──────────────────────────────────────
+
+/// Path to the autostart .desktop file.
+fn autostart_desktop_path() -> PathBuf {
+    let config_dir = dirs::config_dir().unwrap_or_else(|| PathBuf::from("~/.config"));
+    config_dir.join("autostart").join("zureshot.desktop")
+}
+
+/// Check whether Zureshot is configured to launch at login.
+pub fn get_autostart_enabled() -> bool {
+    autostart_desktop_path().exists()
+}
+
+/// Enable or disable launch at login by creating/removing the .desktop file.
+pub fn set_autostart_enabled(enabled: bool) {
+    let path = autostart_desktop_path();
+    if enabled {
+        let dir = path.parent().unwrap();
+        let _ = std::fs::create_dir_all(dir);
+
+        // Determine the executable path. In production (.deb / AppImage),
+        // the binary is usually at /usr/bin/zureshot or similar.
+        let exec = std::env::current_exe()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|_| "zureshot".to_string());
+
+        let content = format!(
+            "[Desktop Entry]\n\
+             Type=Application\n\
+             Name=Zureshot\n\
+             Exec={exec}\n\
+             Icon=zureshot\n\
+             Comment=Screen capture and recording tool\n\
+             Terminal=false\n\
+             Categories=Utility;Graphics;\n\
+             StartupNotify=false\n\
+             X-GNOME-Autostart-enabled=true\n"
+        );
+        match std::fs::write(&path, content) {
+            Ok(()) => println!("[zureshot-linux] Autostart enabled: {}", path.display()),
+            Err(e) => eprintln!("[zureshot-linux] Failed to write autostart file: {}", e),
+        }
+    } else {
+        match std::fs::remove_file(&path) {
+            Ok(()) => println!("[zureshot-linux] Autostart disabled"),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => eprintln!("[zureshot-linux] Failed to remove autostart file: {}", e),
+        }
+    }
+}
+
+// ── First-run permission guide ───────────────────────────────────────
+
+/// Show a first-run dialog explaining Linux screen capture permissions.
+///
+/// On Linux, every recording/screenshot triggers a system Portal dialog
+/// the first time. This guide helps set user expectations.
+pub fn show_first_run_guide() {
+    show_info_dialog(
+        "Welcome to Zureshot",
+        "Zureshot uses XDG Desktop Portal for screen capture.\n\n\
+         When you first record or take a screenshot, your desktop \
+         environment will ask you to choose which screen or window \
+         to share. This is a standard Linux security feature.\n\n\
+         Tip: On GNOME, you can select \"Monitor\" to share your \
+         entire screen, or pick a specific window.",
+    );
+}

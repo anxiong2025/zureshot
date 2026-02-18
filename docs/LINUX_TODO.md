@@ -315,23 +315,23 @@ pipewire = "0.8"              # PipeWire 直接集成
 > ⚠️ 这些 crate 是 Linux-only 的，CI 的 Ubuntu job 需要安装对应 -dev 包。
 > macOS job 不受影响（条件编译）。
 
-### Phase 3：完善体验 → 发布 v0.5.0-beta
+### Phase 3：完善体验 → 发布 v0.5.0-beta ✅ 代码完成
 
 > 预估工时：**2-3 天**
 > 目标：功能完整的 Linux 版本，以 beta 形式发布
 > 发布策略：GitHub Release 标记为 `Pre-release`，README 标注 "Linux support is experimental"
 > ⚠️ 因无 Linux 实机测试，所有 Linux 功能均为 beta 状态，待社区反馈 / 实机验证后升级为 stable
 
-- [ ] **3.1** 全局快捷键适配（Tauri global-shortcut 插件，验证 Wayland 下工作情况）
-- [ ] **3.2** 自动更新支持（Tauri updater，Linux 端验证）
-- [ ] **3.3** 开机自启（`~/.config/autostart/` .desktop 文件）
-- [ ] **3.4** 桌面集成：`.desktop` 文件、应用图标
-- [ ] **3.5** Linux 端 UI 微调（字体渲染、窗口透明度在 Wayland/X11 下的表现）
-- [ ] **3.6** 权限引导：首次运行提示用户允许 Screen Cast 权限
-- [ ] **3.7** CI 产出 release artifacts（.deb + .AppImage + 更新 JSON）
+- [x] **3.1** 全局快捷键适配（Tauri global-shortcut 插件，验证 Wayland 下工作情况）
+- [x] **3.2** 自动更新支持（Tauri updater，Linux 端验证）
+- [x] **3.3** 开机自启（`~/.config/autostart/` .desktop 文件）
+- [x] **3.4** 桌面集成：`.desktop` 文件、应用图标
+- [x] **3.5** Linux 端 UI 微调（字体渲染、窗口透明度在 Wayland/X11 下的表现）
+- [x] **3.6** 权限引导：首次运行提示用户允许 Screen Cast 权限
+- [x] **3.7** CI 产出 release artifacts（.deb + .AppImage + 更新 JSON）
 - [ ] **3.8** CI 配置 `TAURI_SIGNING_PRIVATE_KEY` GitHub Secret ✅ 已配置
-- [ ] **3.9** README 添加 Linux 安装说明 + beta 提示
-- [ ] **3.10** 测试矩阵：Ubuntu 24.04 GNOME (Wayland) + Ubuntu 24.04 GNOME (X11)
+- [x] **3.9** README 添加 Linux 安装说明 + beta 提示
+- [ ] **3.10** 测试矩阵：Ubuntu 24.04 GNOME (Wayland) + Ubuntu 24.04 GNOME (X11)（待实机验证）
 
 ---
 
@@ -357,7 +357,7 @@ pipewire = "0.8"              # PipeWire 直接集成
 | Phase 1 (构建+截屏) | ~600 行 Rust + ~100 行 YAML | ~300 行重构 | 3-5 天 → 实际 2 天 | ✅ 完成 |
 | Phase 2 (录屏 MVP) | ~860 行 Rust | ~30 行修改 | 5-7 天 → 实际 1 天 | ✅ 代码完成 |
 | Phase 2.5 (性能优化) | ~1200-1500 行 Rust | ~800 行重写 | 5-8 天 | ⬜ 计划中 |
-| Phase 3 (完善体验) | ~200 行 Rust + 文档 | ~100 行微调 | 2-3 天 | ⬜ 未开始 |
+| Phase 3 (完善体验) | ~200 行 Rust + 文档 | ~100 行微调 | 2-3 天 | ✅ 代码完成 |
 | **合计** | **~2900-3300 行新代码** | **~1230 行重构** | **15-23 天** |
 
 > 对比：macOS 版现有 Rust 代码约 3100 行。Linux 版最终约 3000+ 行新代码。

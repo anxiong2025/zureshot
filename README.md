@@ -5,12 +5,13 @@
 <h1 align="center">Zureshot</h1>
 
 <p align="center">
-  <strong>Pixel-perfect screen recording for Mac.</strong><br>
-  Built with Rust. Powered by Apple Silicon.
+  <strong>Pixel-perfect screen recording for Mac & Linux.</strong><br>
+  Built with Rust. Powered by native APIs.
 </p>
 
 <p align="center">
   <img src="https://img.shields.io/badge/macOS-13%2B-black?logo=apple" alt="macOS 13+">
+  <img src="https://img.shields.io/badge/Linux-Ubuntu%2024.04%2B-orange?logo=ubuntu" alt="Ubuntu 24.04+">
   <img src="https://img.shields.io/badge/Apple%20Silicon-M1%20|%20M2%20|%20M3%20|%20M4-blue?logo=apple" alt="Apple Silicon">
   <img src="https://img.shields.io/badge/Codec-HEVC%20H.265-green" alt="HEVC">
   <img src="https://img.shields.io/badge/License-MIT-yellow" alt="MIT">
@@ -111,6 +112,7 @@ A 60-second Retina recording at 60fps: **~135 MB** (vs 200+ MB with H.264).
 - **🎯 Window Exclusion** — automatically hides Zureshot's own UI from recordings
 - **⌨️ Keyboard Shortcuts** — `⌘⇧R` to record, `⌘⇧A` for region select
 - **🌗 Quality Presets** — Standard (30fps) and High (60fps)
+- **🐧 Linux Support** — Ubuntu 24.04+, XDG Portal + GStreamer pipeline (beta)
 
 ---
 
@@ -207,6 +209,8 @@ A 60-second Retina recording at 60fps: **~135 MB** (vs 200+ MB with H.264).
 
 ## 🚀 Quick Start
 
+### macOS
+
 ```bash
 # Prerequisites: Rust, Node.js, pnpm
 git clone https://github.com/anxiong2025/zureshot.git
@@ -217,6 +221,39 @@ pnpm tauri dev
 
 > **First launch**: macOS will ask for Screen Recording permission. Grant it in **System Settings → Privacy & Security → Screen Recording**, then restart the app.
 
+### Linux (Ubuntu 24.04+)
+
+```bash
+# Install system dependencies
+sudo apt-get install -y \
+  libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf \
+  xdg-desktop-portal zenity python3 python3-dbus python3-gi \
+  gir1.2-glib-2.0 gstreamer1.0-tools gstreamer1.0-plugins-base \
+  gstreamer1.0-plugins-good gstreamer1.0-plugins-ugly \
+  gstreamer1.0-pipewire ffmpeg
+
+# Build from source
+git clone https://github.com/anxiong2025/zureshot.git
+cd zureshot
+pnpm install
+pnpm tauri dev
+```
+
+Or install from a release:
+
+```bash
+# .deb package
+sudo dpkg -i Zureshot_*.deb
+
+# Or AppImage
+chmod +x Zureshot_*.AppImage
+./Zureshot_*.AppImage
+```
+
+> **First launch**: When you first record or screenshot, your desktop environment will show a portal dialog asking which screen/window to share. This is a standard Linux security feature.
+
+> ⚠️ **Linux support is in beta.** Screen recording uses XDG Desktop Portal + GStreamer. Tested on Ubuntu 24.04 GNOME (Wayland). Feedback and bug reports welcome!
+
 ---
 
 ## 🔧 Build for Production
@@ -225,7 +262,9 @@ pnpm tauri dev
 pnpm tauri build
 ```
 
-The `.dmg` installer will be in `src-tauri/target/release/bundle/dmg/`.
+**macOS:** The `.dmg` installer will be in `src-tauri/target/release/bundle/dmg/`.
+
+**Linux:** The `.deb` and `.AppImage` will be in `src-tauri/target/release/bundle/deb/` and `src-tauri/target/release/bundle/appimage/`.
 
 ---
 
@@ -256,9 +295,24 @@ The `.dmg` installer will be in `src-tauri/target/release/bundle/dmg/`.
 | Requirement | Minimum | Recommended |
 |-------------|---------|-------------|
 | **macOS** | 13.0 Ventura | 14.0+ Sonoma |
+| **Linux** | Ubuntu 24.04 (Wayland) | GNOME desktop |
 | **RAM** | 8 GB | 16 GB |
 | **Disk** | ~200 MB/min (Standard) | SSD recommended |
 | **Display** | Any resolution | Retina (2x) for best quality |
+
+### Linux Requirements (beta)
+
+| Component | Required | Notes |
+|-----------|----------|-------|
+| **Desktop** | GNOME (Wayland recommended) | X11 also supported |
+| **Display Server** | PipeWire | Screen capture transport |
+| **Portal** | XDG Desktop Portal | Permission & source selection |
+| **Encoding** | GStreamer + x264 | Video encoding (H.264) |
+| **Audio** | PulseAudio / PipeWire-Pulse | System audio capture |
+| **Screenshots** | gnome-screenshot / grim | Region capture |
+| **Dialogs** | zenity | Native dialog boxes |
+
+> 🐧 Linux screen recording uses a GStreamer subprocess pipeline with H.264 encoding. Hardware-accelerated encoding (VA-API, NVENC) is planned for a future release.
 
 ---
 

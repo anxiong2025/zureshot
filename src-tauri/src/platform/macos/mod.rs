@@ -304,6 +304,87 @@ pub fn open_folder(path: &str) -> Result<(), String> {
     Ok(())
 }
 
+// ── Autostart (Launch at Login) ──────────────────────────────────────
+
+/// Check whether Zureshot is configured to launch at login.
+///
+/// Uses `osascript` to query System Events login items.
+pub fn get_autostart_enabled() -> bool {
+    let output = std::process::Command::new("osascript")
+        .args([
+            "-e",
+            "tell application \"System Events\" to get the name of every login item",
+        ])
+        .output();
+
+    match output {
+        Ok(o) => {
+            let stdout = String::from_utf8_lossy(&o.stdout);
+            stdout.contains("Zureshot")
+        }
+        Err(_) => false,
+    }
+}
+
+/// Enable or disable launch at login.
+///
+/// Uses `osascript` to add/remove from System Events login items.
+pub fn set_autostart_enabled(enabled: bool) {
+    if enabled {
+        // Find the .app bundle path — typically /Applications/Zureshot.app
+        // or the development path
+        let app_path = std::env::current_exe()
+            .ok()
+            .and_then(|p| {
+                // Walk up to find the .app bundle
+                let mut path = p.as_path();
+                while let Some(parent) = path.parent() {
+                    if path.extension().and_then(|e| e.to_str()) == Some("app") {
+                        return Some(path.to_path_buf());
+                    }
+                    path = parent;
+                }
+                None
+            })
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|| "/Applications/Zureshot.app".to_string());
+
+        let script = format!(
+            "tell application \"System Events\" to make login item at end \
+             with properties {{path:\"{}\", hidden:false}}",
+            app_path
+        );
+        match std::process::Command::new("osascript")
+            .args(["-e", &script])
+            .output()
+        {
+            Ok(o) if o.status.success() => println!("[zureshot] Autostart enabled"),
+            Ok(o) => eprintln!(
+                "[zureshot] Failed to enable autostart: {}",
+                String::from_utf8_lossy(&o.stderr)
+            ),
+            Err(e) => eprintln!("[zureshot] osascript error: {}", e),
+        }
+    } else {
+        let script = "tell application \"System Events\" to delete login item \"Zureshot\"";
+        match std::process::Command::new("osascript")
+            .args(["-e", script])
+            .output()
+        {
+            Ok(_) => println!("[zureshot] Autostart disabled"),
+            Err(e) => eprintln!("[zureshot] osascript error: {}", e),
+        }
+    }
+}
+
+// ── First-run (no-op on macOS — handled by system permission dialog) ─
+
+/// On macOS, the system handles the screen recording permission prompt
+/// automatically, so no custom first-run guide is needed.
+pub fn show_first_run_guide() {
+    // no-op: macOS shows its own Screen Recording permission dialog
+}
+
 // ── Helpers ──────────────────────────────────────────────────────────
 
 /// Collect SCWindow objects that belong to our app (for exclusion from capture).
