@@ -1,0 +1,333 @@
+<script>
+  /** @type {{ thumbnails: any[], waveform: any, duration: number, currentTime: number, trimStart: number, trimEnd: number, onSeek: (t: number) => void, onTrimChange: (s: number, e: number) => void }} */
+  let {
+    thumbnails = [],
+    waveform = null,
+    duration = 0,
+    currentTime = 0,
+    trimStart = 0,
+    trimEnd = 0,
+    onSeek = () => {},
+    onTrimChange = () => {},
+  } = $props();
+
+  let trackEl = $state(null);
+  let dragging = $state(null); // 'playhead' | 'trim-start' | 'trim-end' | null
+  let trackWidth = $state(0);
+
+  // Derived positions (percentage)
+  let playheadPct = $derived(duration > 0 ? (currentTime / duration) * 100 : 0);
+  let trimStartPct = $derived(duration > 0 ? (trimStart / duration) * 100 : 0);
+  let trimEndPct = $derived(duration > 0 ? (trimEnd / duration) * 100 : 0);
+
+  function timeFromX(clientX) {
+    if (!trackEl || duration <= 0) return 0;
+    const rect = trackEl.getBoundingClientRect();
+    const pct = Math.max(0, Math.min(1, (clientX - rect.left) / rect.width));
+    return pct * duration;
+  }
+
+  function handleTrackClick(e) {
+    if (dragging) return;
+    const time = timeFromX(e.clientX);
+    // Clamp to trim range
+    const clamped = Math.max(trimStart, Math.min(trimEnd, time));
+    onSeek(clamped);
+  }
+
+  function startDrag(type, e) {
+    e.stopPropagation();
+    e.preventDefault();
+    dragging = type;
+
+    const handleMove = (e) => {
+      const time = timeFromX(e.clientX);
+      if (dragging === 'playhead') {
+        onSeek(Math.max(trimStart, Math.min(trimEnd, time)));
+      } else if (dragging === 'trim-start') {
+        const newStart = Math.max(0, Math.min(trimEnd - 0.1, time));
+        onTrimChange(newStart, trimEnd);
+      } else if (dragging === 'trim-end') {
+        const newEnd = Math.max(trimStart + 0.1, Math.min(duration, time));
+        onTrimChange(trimStart, newEnd);
+      }
+    };
+
+    const handleUp = () => {
+      dragging = null;
+      window.removeEventListener('mousemove', handleMove);
+      window.removeEventListener('mouseup', handleUp);
+    };
+
+    window.addEventListener('mousemove', handleMove);
+    window.addEventListener('mouseup', handleUp);
+  }
+
+  function formatTimeShort(s) {
+    const m = Math.floor(s / 60);
+    const sec = Math.floor(s % 60);
+    return `${m}:${sec.toString().padStart(2, '0')}`;
+  }
+</script>
+
+<div class="timeline">
+  <!-- Time ruler -->
+  <div class="ruler">
+    {#each Array(Math.min(Math.ceil(duration), 60)) as _, i}
+      {#if i % Math.max(1, Math.floor(duration / 10)) === 0 || duration <= 10}
+        <span
+          class="ruler-mark"
+          style="left: {(i / duration) * 100}%"
+        >
+          {formatTimeShort(i)}
+        </span>
+      {/if}
+    {/each}
+    <span class="ruler-mark" style="left: 100%">{formatTimeShort(duration)}</span>
+  </div>
+
+  <!-- Track area -->
+  <!-- svelte-ignore a11y_click_events_have_key_events -->
+  <!-- svelte-ignore a11y_no_static_element_interactions -->
+  <div class="track" bind:this={trackEl} onmousedown={handleTrackClick}>
+    <!-- Thumbnail strip -->
+    <div class="thumb-strip">
+      {#each thumbnails as thumb}
+        <img
+          src={thumb.data_url}
+          alt=""
+          class="thumb-img"
+          style="left: {(thumb.time_secs / duration) * 100}%"
+          draggable="false"
+        />
+      {/each}
+    </div>
+
+    <!-- Waveform overlay -->
+    {#if waveform && waveform.samples.length > 0}
+      <div class="waveform">
+        {#each waveform.samples as amplitude, i}
+          <div
+            class="wave-bar"
+            style="height: {Math.max(2, amplitude * 100)}%; left: {(i / waveform.samples.length) * 100}%; width: {100 / waveform.samples.length}%"
+          ></div>
+        {/each}
+      </div>
+    {/if}
+
+    <!-- Dim regions outside trim -->
+    <div class="trim-mask trim-mask-left" style="width: {trimStartPct}%"></div>
+    <div class="trim-mask trim-mask-right" style="width: {100 - trimEndPct}%"></div>
+
+    <!-- Trim handles -->
+    <!-- svelte-ignore a11y_no_static_element_interactions -->
+    <div
+      class="trim-handle trim-handle-start"
+      style="left: {trimStartPct}%"
+      onmousedown={(e) => startDrag('trim-start', e)}
+    >
+      <div class="handle-grip">
+        <div class="handle-line"></div>
+        <div class="handle-line"></div>
+      </div>
+    </div>
+
+    <!-- svelte-ignore a11y_no_static_element_interactions -->
+    <div
+      class="trim-handle trim-handle-end"
+      style="left: {trimEndPct}%"
+      onmousedown={(e) => startDrag('trim-end', e)}
+    >
+      <div class="handle-grip">
+        <div class="handle-line"></div>
+        <div class="handle-line"></div>
+      </div>
+    </div>
+
+    <!-- Trim border (highlight) -->
+    <div
+      class="trim-border"
+      style="left: {trimStartPct}%; width: {trimEndPct - trimStartPct}%"
+    ></div>
+
+    <!-- Playhead -->
+    <!-- svelte-ignore a11y_no_static_element_interactions -->
+    <div
+      class="playhead"
+      style="left: {playheadPct}%"
+      onmousedown={(e) => startDrag('playhead', e)}
+    >
+      <div class="playhead-head"></div>
+      <div class="playhead-line"></div>
+    </div>
+  </div>
+</div>
+
+<style>
+  .timeline {
+    padding: 8px 16px 16px;
+    user-select: none;
+  }
+
+  /* ─── Ruler ─── */
+  .ruler {
+    position: relative;
+    height: 18px;
+    margin-bottom: 4px;
+  }
+
+  .ruler-mark {
+    position: absolute;
+    transform: translateX(-50%);
+    font-size: 9px;
+    font-weight: 500;
+    color: #555;
+    font-variant-numeric: tabular-nums;
+  }
+
+  /* ─── Track ─── */
+  .track {
+    position: relative;
+    height: 64px;
+    border-radius: 6px;
+    overflow: hidden;
+    background: #1a1a1e;
+    cursor: pointer;
+  }
+
+  /* ─── Thumbnails ─── */
+  .thumb-strip {
+    position: absolute;
+    inset: 0;
+    display: flex;
+  }
+
+  .thumb-img {
+    position: absolute;
+    top: 0;
+    height: 100%;
+    width: auto;
+    transform: translateX(-50%);
+    opacity: 0.7;
+    pointer-events: none;
+  }
+
+  /* ─── Waveform ─── */
+  .waveform {
+    position: absolute;
+    bottom: 0;
+    left: 0;
+    right: 0;
+    height: 24px;
+    display: flex;
+    align-items: flex-end;
+    pointer-events: none;
+  }
+
+  .wave-bar {
+    position: absolute;
+    bottom: 0;
+    background: rgba(108, 92, 231, 0.4);
+    min-height: 1px;
+    border-radius: 1px 1px 0 0;
+  }
+
+  /* ─── Trim masks ─── */
+  .trim-mask {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    background: rgba(0, 0, 0, 0.65);
+    pointer-events: none;
+    z-index: 2;
+  }
+
+  .trim-mask-left {
+    left: 0;
+  }
+
+  .trim-mask-right {
+    right: 0;
+  }
+
+  /* ─── Trim border ─── */
+  .trim-border {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    border-top: 2px solid #f39c12;
+    border-bottom: 2px solid #f39c12;
+    pointer-events: none;
+    z-index: 3;
+  }
+
+  /* ─── Trim handles ─── */
+  .trim-handle {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    width: 14px;
+    transform: translateX(-50%);
+    cursor: col-resize;
+    z-index: 5;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+
+  .trim-handle-start {
+    transform: translateX(-7px);
+    border-radius: 4px 0 0 4px;
+    background: #f39c12;
+  }
+
+  .trim-handle-end {
+    transform: translateX(-7px);
+    border-radius: 0 4px 4px 0;
+    background: #f39c12;
+  }
+
+  .handle-grip {
+    display: flex;
+    gap: 2px;
+  }
+
+  .handle-line {
+    width: 1.5px;
+    height: 16px;
+    background: rgba(0,0,0,0.4);
+    border-radius: 1px;
+  }
+
+  /* ─── Playhead ─── */
+  .playhead {
+    position: absolute;
+    top: -4px;
+    bottom: 0;
+    width: 2px;
+    transform: translateX(-1px);
+    z-index: 10;
+    cursor: col-resize;
+    pointer-events: auto;
+  }
+
+  .playhead-head {
+    width: 10px;
+    height: 10px;
+    background: #fff;
+    border-radius: 2px;
+    transform: translateX(-4px) rotate(45deg);
+    position: relative;
+    top: -2px;
+    box-shadow: 0 1px 4px rgba(0,0,0,0.5);
+  }
+
+  .playhead-line {
+    width: 2px;
+    position: absolute;
+    top: 6px;
+    bottom: 0;
+    background: #fff;
+    box-shadow: 0 0 6px rgba(255,255,255,0.3);
+  }
+</style>

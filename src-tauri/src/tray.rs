@@ -3,7 +3,7 @@
 use tauri::{
     image::Image,
     menu::{CheckMenuItem, Menu, MenuItem},
-    tray::TrayIconBuilder,
+    tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
     AppHandle, Emitter, Manager,
 };
 use tauri_plugin_updater::UpdaterExt;
@@ -18,6 +18,10 @@ const TRAY_ID: &str = "zureshot-tray";
 
 /// Guard against double-quit: once set, further quit requests are ignored.
 static QUITTING: AtomicBool = AtomicBool::new(false);
+
+/// Tracks whether we're currently recording, so tray click handler can decide
+/// whether to show the menu or directly stop recording.
+static IS_RECORDING: AtomicBool = AtomicBool::new(false);
 
 /// Load tray icon from bundled resources
 fn load_tray_icon(app: &AppHandle, recording: bool) -> Result<Image<'static>, Box<dyn std::error::Error>> {
@@ -75,6 +79,9 @@ fn update_tray_icon(app: &AppHandle, recording: bool) {
         match load_tray_icon(app, recording) {
             Ok(icon) => {
                 let _ = tray.set_icon(Some(icon));
+                // Recording icon is colored (red stop button) — not a template
+                // Normal icon is monochrome — use as template for macOS dark/light mode
+                let _ = tray.set_icon_as_template(!recording);
             }
             Err(e) => eprintln!("[zureshot] Failed to update tray icon: {}", e),
         }
@@ -152,6 +159,14 @@ fn build_menu(app: &AppHandle, is_recording: bool) -> Result<Menu<tauri::Wry>, B
         !is_recording,
         Some("CmdOrCtrl+Shift+A"),
     )?;
+    let scroll_screenshot = MenuItem::with_id(
+        app,
+        "scroll_screenshot",
+        "Scrolling Screenshot",
+        !is_recording,
+        Some("CmdOrCtrl+Shift+L"),
+    )?;
+    let separator_screenshots = MenuItem::with_id(app, "sep_ss", "────────────", false, None::<&str>)?;
     let record_region = MenuItem::with_id(
         app,
         "record_region",
@@ -204,6 +219,8 @@ fn build_menu(app: &AppHandle, is_recording: bool) -> Result<Menu<tauri::Wry>, B
         app,
         &[
             &screenshot_region,
+            &scroll_screenshot,
+            &separator_screenshots,
             &record_region,
             &stop_recording,
             &separator,
@@ -225,12 +242,53 @@ pub fn setup_tray(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
 
     let _tray = TrayIconBuilder::with_id(TRAY_ID)
         .icon(icon)
-        .icon_as_template(false)
+        .icon_as_template(true)
         .menu(&menu)
         .show_menu_on_left_click(true)
         .tooltip("Zureshot - Screen Recorder")
         .on_menu_event(move |app, event| {
             handle_menu_event(app, event.id.as_ref());
+        })
+        .on_tray_icon_event(|tray, event| {
+            // When recording, left-click on tray icon directly stops recording
+            // (instead of opening the menu dropdown)
+            match &event {
+                TrayIconEvent::Click {
+                    button,
+                    button_state,
+                    ..
+                } => {
+                    let recording = IS_RECORDING.load(Ordering::SeqCst);
+                    println!(
+                        "[zureshot] Tray click: button={:?} state={:?} is_recording={}",
+                        button, button_state, recording
+                    );
+                    if *button == MouseButton::Left
+                        && *button_state == MouseButtonState::Up
+                        && recording
+                    {
+                        println!("[zureshot] Stopping recording via tray click...");
+                        let app = tray.app_handle().clone();
+                        // Immediately update UI
+                        update_menu_state(&app, false);
+                        update_tray_icon(&app, false);
+                        IS_RECORDING.store(false, Ordering::SeqCst);
+                        // Stop recording on background thread
+                        std::thread::spawn(move || {
+                            match commands::do_stop_recording(&app) {
+                                Ok(result) => {
+                                    println!(
+                                        "[zureshot] Stopped via tray click: {} ({:.1}s)",
+                                        result.path, result.duration_secs
+                                    );
+                                }
+                                Err(e) => eprintln!("[zureshot] Stop error: {}", e),
+                            }
+                        });
+                    }
+                }
+                _ => {}
+            }
         })
         .build(app)?;
 
@@ -255,9 +313,12 @@ fn update_menu_state(app: &AppHandle, is_recording: bool) {
                 if let Err(e) = tray.set_menu(Some(menu)) {
                     eprintln!("[zureshot] Failed to update tray menu: {}", e);
                 }
+                // When recording: left click stops recording directly (no menu)
+                // When idle: left click opens menu as usual
+                let _ = tray.set_show_menu_on_left_click(!is_recording);
                 // Update tooltip to show state
                 let tooltip = if is_recording {
-                    "Zureshot - 🔴 Recording..."
+                    "Zureshot - ⏹ Click to Stop Recording"
                 } else {
                     "Zureshot - Screen Recorder"
                 };
@@ -271,6 +332,7 @@ fn update_menu_state(app: &AppHandle, is_recording: bool) {
 /// Called from commands.rs when recording stops (e.g. via the recording bar).
 /// Resets tray icon and menu to idle state.
 pub fn notify_recording_stopped(app: &AppHandle) {
+    IS_RECORDING.store(false, Ordering::SeqCst);
     update_menu_state(app, false);
     update_tray_icon(app, false);
 }
@@ -278,6 +340,8 @@ pub fn notify_recording_stopped(app: &AppHandle) {
 /// Called from commands.rs when recording starts.
 /// Switches tray icon to recording state (red dot) and enables Stop menu.
 pub fn notify_recording_started(app: &AppHandle) {
+    IS_RECORDING.store(true, Ordering::SeqCst);
+    println!("[zureshot] notify_recording_started: IS_RECORDING=true, disabling menu-on-left-click");
     update_menu_state(app, true);
     update_tray_icon(app, true);
 }
@@ -389,6 +453,12 @@ fn handle_menu_event(app: &AppHandle, id: &str) {
                 Err(e) => eprintln!("[zureshot] Screenshot region selection error: {}", e),
             }
         }
+        "scroll_screenshot" => {
+            match commands::do_start_scroll_screenshot_selection(app) {
+                Ok(()) => println!("[zureshot] Scroll screenshot selector opened via menu"),
+                Err(e) => eprintln!("[zureshot] Scroll screenshot selection error: {}", e),
+            }
+        }
         "record_region" => {
             match commands::do_start_region_selection(app) {
                 Ok(()) => println!("[zureshot] Region selector opened via menu"),
@@ -483,7 +553,7 @@ fn handle_menu_event(app: &AppHandle, id: &str) {
             // Close any open windows (region-selector, recording-bar, overlay)
             // before starting the quit sequence. These windows don't hold
             // critical state — they just need to be torn down cleanly.
-            for label in ["region-selector", "recording-bar", "recording-overlay"] {
+            for label in ["region-selector", "recording-bar", "recording-overlay", "camera-overlay", "scroll-capture-bar"] {
                 if let Some(win) = app.get_webview_window(label) {
                     let _ = win.destroy();
                 }
@@ -512,9 +582,11 @@ fn handle_menu_event(app: &AppHandle, id: &str) {
                         Ok(Err(e)) => eprintln!("[zureshot] Error finalizing on quit: {}", e),
                         Err(_) => eprintln!("[zureshot] PANIC during finalize on quit"),
                     }
+                    crate::SHOULD_EXIT.store(true, std::sync::atomic::Ordering::SeqCst);
                     app.exit(0);
                 });
             } else {
+                crate::SHOULD_EXIT.store(true, std::sync::atomic::Ordering::SeqCst);
                 app.exit(0);
             }
         }

@@ -1,6 +1,11 @@
 //! macOS platform implementation — ScreenCaptureKit + AVAssetWriter.
 
+pub mod camera;
 pub mod capture;
+pub mod editor;
+pub mod mouse_tracker;
+pub mod ocr;
+pub mod scroll_capture;
 pub mod writer;
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -409,6 +414,11 @@ fn collect_app_windows_to_exclude(
             let title = unsafe { w.title() }
                 .map(|t| t.to_string())
                 .unwrap_or_default();
+            // Don't exclude the camera overlay — it should appear in recordings
+            if title == "Camera" {
+                println!("[zureshot] NOT excluding camera window: PID={} title={:?}", pid, title);
+                continue;
+            }
             println!("[zureshot] Excluding window: PID={} title={:?}", pid, title);
             excluded.push(w.clone());
         }

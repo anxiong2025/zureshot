@@ -97,6 +97,53 @@
     await win.hide();
   }
 
+  async function pinScreenshot() {
+    cancelAutoHide();
+    if (screenshot?.path) {
+      try {
+        await invoke('pin_screenshot', { path: screenshot.path });
+      } catch (e) {
+        console.error('Failed to pin screenshot:', e);
+      }
+    }
+    visible = false;
+    screenshot = null;
+    imgSrc = '';
+    const win = getCurrentWindow();
+    await win.hide();
+  }
+
+  let ocrText = $state('');
+  let ocrLoading = $state(false);
+
+  async function ocrScreenshot() {
+    cancelAutoHide();
+    if (!screenshot?.path) return;
+    ocrLoading = true;
+    try {
+      const result = await invoke('ocr_screenshot', { path: screenshot.path });
+      if (result.full_text) {
+        // Copy recognized text to clipboard via a textarea trick
+        const ta = document.createElement('textarea');
+        ta.value = result.full_text;
+        document.body.appendChild(ta);
+        ta.select();
+        document.execCommand('copy');
+        document.body.removeChild(ta);
+        ocrText = `Copied ${result.block_count} text blocks`;
+        setTimeout(() => { ocrText = ''; }, 2000);
+      } else {
+        ocrText = 'No text found';
+        setTimeout(() => { ocrText = ''; }, 2000);
+      }
+    } catch (e) {
+      console.error('OCR failed:', e);
+      ocrText = 'OCR failed';
+      setTimeout(() => { ocrText = ''; }, 2000);
+    }
+    ocrLoading = false;
+  }
+
   function formatSize(bytes) {
     if (bytes < 1024) return `${bytes} B`;
     if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
@@ -143,7 +190,28 @@
           </svg>
           Save
         </button>
+        <button class="action-btn" onclick={pinScreenshot} title="Pin to desktop">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M12 2L12 12"/>
+            <path d="M18 8L18 12a6 6 0 01-12 0L6 8"/>
+            <line x1="12" y1="17" x2="12" y2="22"/>
+          </svg>
+          Pin
+        </button>
+        <button class="action-btn" onclick={ocrScreenshot} title="Recognize text (OCR)" disabled={ocrLoading}>
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <polyline points="4 7 4 4 20 4 20 7"/>
+            <line x1="9" y1="20" x2="15" y2="20"/>
+            <line x1="12" y1="4" x2="12" y2="20"/>
+          </svg>
+          {ocrLoading ? '...' : 'OCR'}
+        </button>
       </div>
+
+      <!-- OCR status -->
+      {#if ocrText}
+        <div class="ocr-status">{ocrText}</div>
+      {/if}
 
       <!-- Info at bottom -->
       <div class="info">
@@ -156,8 +224,8 @@
 <style>
   .preview-card {
     position: relative;
-    width: 260px;
-    height: 170px;
+    width: 300px;
+    height: 180px;
     border-radius: 10px;
     overflow: hidden;
     box-shadow: 0 4px 20px rgba(0, 0, 0, 0.5);
@@ -237,14 +305,16 @@
   /* Action buttons */
   .actions {
     display: flex;
-    gap: 10px;
+    gap: 6px;
+    flex-wrap: wrap;
+    justify-content: center;
   }
 
   .action-btn {
     display: flex;
     align-items: center;
-    gap: 5px;
-    padding: 6px 16px;
+    gap: 4px;
+    padding: 5px 10px;
     border-radius: 16px;
     border: none;
     background: rgba(255, 255, 255, 0.18);
@@ -263,6 +333,14 @@
   }
   .action-btn:active {
     transform: scale(0.97);
+  }
+
+  /* OCR status */
+  .ocr-status {
+    font-size: 10px;
+    color: #30d158;
+    font-weight: 600;
+    text-align: center;
   }
 
   /* Info text */
