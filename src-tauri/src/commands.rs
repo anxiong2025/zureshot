@@ -1038,9 +1038,12 @@ pub fn do_open_camera_overlay(app: &AppHandle) -> Result<(), String> {
 /// Close the camera bubble overlay window.
 pub fn do_close_camera_overlay(app: &AppHandle) -> Result<(), String> {
     // Stop native camera if running
-    if let Some(state) = app.try_state::<Mutex<platform::macos::camera::NativeCameraState>>() {
-        if let Ok(camera_state) = state.lock() {
-            platform::macos::camera::stop_native_camera_stream(&camera_state);
+    #[cfg(target_os = "macos")]
+    {
+        if let Some(state) = app.try_state::<Mutex<platform::macos::camera::NativeCameraState>>() {
+            if let Ok(camera_state) = state.lock() {
+                platform::macos::camera::stop_native_camera_stream(&camera_state);
+            }
         }
     }
     if let Some(win) = app.get_webview_window("camera-overlay") {
@@ -1570,11 +1573,11 @@ pub struct OcrResponse {
 
 /// Recognize text in a screenshot image.
 #[tauri::command]
-pub async fn ocr_screenshot(path: String) -> Result<OcrResponse, String> {
+pub async fn ocr_screenshot(_path: String) -> Result<OcrResponse, String> {
     #[cfg(target_os = "macos")]
     {
         let result = tokio::task::spawn_blocking(move || {
-            crate::platform::macos::ocr::recognize_text(&path)
+            crate::platform::macos::ocr::recognize_text(&_path)
         })
         .await
         .map_err(|e| format!("Task join error: {}", e))??;
@@ -1669,10 +1672,10 @@ pub async fn start_scroll_screenshot_selection(app: AppHandle) -> Result<(), Str
 #[tauri::command]
 pub async fn start_scroll_capture(
     app: AppHandle,
-    x: f64,
-    y: f64,
-    width: f64,
-    height: f64,
+    _x: f64,
+    _y: f64,
+    _width: f64,
+    _height: f64,
 ) -> Result<ScrollCaptureStatus, String> {
     // Close region selector
     if let Some(win) = app.get_webview_window("region-selector") {
@@ -1683,7 +1686,7 @@ pub async fn start_scroll_capture(
     {
         use crate::platform::macos::scroll_capture::ScrollCaptureSession;
 
-        let session = ScrollCaptureSession::new(x, y, width, height)?;
+        let session = ScrollCaptureSession::new(_x, _y, _width, _height)?;
         let status = ScrollCaptureStatus {
             frame_count: session.frame_count(),
             total_height: session.total_height(),
@@ -1708,11 +1711,11 @@ pub async fn start_scroll_capture(
 /// Capture one frame and stitch if new content detected.
 #[tauri::command]
 pub async fn scroll_capture_tick(
-    app: AppHandle,
+    _app: AppHandle,
 ) -> Result<ScrollCaptureStatus, String> {
     #[cfg(target_os = "macos")]
     {
-        let state: tauri::State<'_, Mutex<ScrollCaptureStateWrapper>> = app.state();
+        let state: tauri::State<'_, Mutex<ScrollCaptureStateWrapper>> = _app.state();
         let mut guard = state.lock().map_err(|e| e.to_string())?;
         let session = guard.session.as_mut().ok_or("No scroll capture session active")?;
 
