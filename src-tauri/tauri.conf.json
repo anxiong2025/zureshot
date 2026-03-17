@@ -28,7 +28,7 @@
     "active": true,
     "category": "Utility",
     "createUpdaterArtifacts": "v1Compatible",
-    "targets": ["dmg", "updater", "deb"],
+    "targets": ["dmg", "deb"],
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
