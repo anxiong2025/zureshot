@@ -1283,18 +1283,31 @@ pub async fn screenshot_to_clipboard(
     }
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
-    // Capture to temp file
-    let temp_path = std::env::temp_dir()
-        .join("zureshot_clipboard_capture.png")
+    // Save to permanent location so the path can be pasted in terminals
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let base = dirs::download_dir()
+        .or_else(dirs::home_dir)
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let save_dir = base.join("Zureshot");
+    let _ = std::fs::create_dir_all(&save_dir);
+    let save_path = save_dir
+        .join(format!("zureshot_{}.png", timestamp))
         .to_string_lossy()
         .to_string();
-    platform::imp::take_screenshot_region(x, y, width, height, &temp_path)?;
 
-    // Copy to clipboard
-    platform::imp::copy_image_to_clipboard(&temp_path)?;
+    platform::imp::take_screenshot_region(x, y, width, height, &save_path)?;
 
-    // Clean up
-    let _ = std::fs::remove_file(&temp_path);
+    // Copy image + shell-escaped path to clipboard
+    #[cfg(target_os = "macos")]
+    {
+        let shell_path = shell_escape_path(&save_path);
+        platform::macos::copy_image_to_clipboard_with_path(&save_path, Some(&shell_path))?;
+    }
+    #[cfg(not(target_os = "macos"))]
+    platform::imp::copy_image_to_clipboard(&save_path)?;
 
     // Destroy region selector
     if let Some(win) = app.get_webview_window("region-selector") {
@@ -1305,8 +1318,21 @@ pub async fn screenshot_to_clipboard(
     let preview_path = std::env::temp_dir().join("zureshot_screen_preview.png");
     let _ = std::fs::remove_file(&preview_path);
 
-    println!("[zureshot] Screenshot captured and copied to clipboard");
+    println!("[zureshot] Screenshot captured and copied to clipboard: {}", save_path);
     Ok(())
+}
+
+/// Escape a file path for shell use (spaces and special chars prefixed with backslash).
+fn shell_escape_path(path: &str) -> String {
+    let mut out = String::with_capacity(path.len() + 16);
+    for ch in path.chars() {
+        if matches!(ch, ' ' | '(' | ')' | '[' | ']' | '{' | '}' | '\'' | '"' | '\\' |
+                        '!' | '$' | '`' | '#' | '&' | '*' | ';' | '<' | '>' | '?' | '|' | '~') {
+            out.push('\\');
+        }
+        out.push(ch);
+    }
+    out
 }
 
 /// Tauri command: copy base64-encoded PNG image data to clipboard
@@ -1445,6 +1471,7 @@ pub async fn save_screenshot(path: String) -> Result<String, String> {
 }
 
 /// Tauri command: copy screenshot to clipboard
+/// Also saves the file to its permanent name so the path can be pasted in terminals.
 #[tauri::command]
 pub async fn copy_screenshot(path: String) -> Result<(), String> {
     let src = std::path::Path::new(&path);
@@ -1452,11 +1479,23 @@ pub async fn copy_screenshot(path: String) -> Result<(), String> {
         return Err("Screenshot file not found".into());
     }
 
-    platform::imp::copy_image_to_clipboard(&path)?;
+    // Save to permanent name (strip the leading dot from the hidden temp file)
+    let filename = src.file_name().unwrap_or_default().to_string_lossy().to_string();
+    let final_name = filename.trim_start_matches('.');
+    let dest = src.parent().unwrap().join(final_name);
+    let _ = std::fs::rename(&path, &dest);
 
-    // Clean up temp file after copying
-    let _ = std::fs::remove_file(&path);
-    println!("[zureshot] Screenshot copied to clipboard and temp file removed");
+    let dest_str = dest.to_string_lossy().to_string();
+
+    #[cfg(target_os = "macos")]
+    {
+        let shell_path = shell_escape_path(&dest_str);
+        platform::macos::copy_image_to_clipboard_with_path(&dest_str, Some(&shell_path))?;
+    }
+    #[cfg(not(target_os = "macos"))]
+    platform::imp::copy_image_to_clipboard(&dest_str)?;
+
+    println!("[zureshot] Screenshot copied to clipboard: {}", dest_str);
     Ok(())
 }
 

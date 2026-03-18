@@ -1,6 +1,6 @@
 [package]
 name = "zureshot"
-version = "0.6.0"
+version = "0.6.1"
 description = "Screen capture and recording tool"
 authors = ["robert"]
 edition = "2021"

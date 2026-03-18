@@ -258,14 +258,40 @@ pub fn reveal_file(path: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Copy a PNG image to the clipboard using osascript.
+/// Copy a PNG image to the clipboard using NSPasteboard directly (via JXA).
+/// Sets PNG, TIFF, and optionally the file path as plain text so terminal
+/// emulators (e.g. Ghostty) can paste the path with Cmd+V.
 pub fn copy_image_to_clipboard(path: &str) -> Result<(), String> {
+    copy_image_to_clipboard_with_path(path, None)
+}
+
+pub fn copy_image_to_clipboard_with_path(path: &str, file_path: Option<&str>) -> Result<(), String> {
+    let safe_path = path.replace('\\', "\\\\").replace('\'', "\\'");
+    let path_js = match file_path {
+        Some(p) => format!("'{}'", p.replace('\\', "\\\\").replace('\'', "\\'")),
+        None => "null".to_string(),
+    };
     let script = format!(
-        "set the clipboard to (read (POSIX file \"{}\") as «class PNGf»)",
-        path
+        r#"ObjC.import('AppKit');
+ObjC.import('Foundation');
+var data = $.NSData.dataWithContentsOfFile('{safe_path}');
+if (!data || data.length === 0) {{ throw new Error('Failed to read file'); }}
+var nsImg = $.NSImage.alloc.initWithData(data);
+if (!nsImg || nsImg.isNil()) {{ throw new Error('Failed to create NSImage'); }}
+var tiffData = nsImg.TIFFRepresentation;
+var pb = $.NSPasteboard.generalPasteboard;
+pb.clearContents;
+pb.setDataForType(data, $.NSPasteboardTypePNG);
+pb.setDataForType(tiffData, $.NSPasteboardTypeTIFF);
+var filePath = {path_js};
+if (filePath) {{
+    pb.setStringForType(filePath, 'public.utf8-plain-text');
+}}
+'ok'"#
     );
+
     let output = std::process::Command::new("osascript")
-        .args(["-e", &script])
+        .args(["-l", "JavaScript", "-e", &script])
         .output()
         .map_err(|e| format!("Failed to run osascript: {}", e))?;
 

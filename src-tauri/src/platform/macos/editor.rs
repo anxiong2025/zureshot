@@ -136,76 +136,54 @@ pub struct VideoEditProject {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-//  Video Metadata (via ffprobe)
+//  Video Metadata (via mdls / AVURLAsset — no ffprobe dependency)
 // ═══════════════════════════════════════════════════════════════════════
 
-/// Get video metadata using ffprobe (fast, no decode needed).
+/// Get video metadata using macOS Spotlight (mdls) with AVURLAsset JXA fallback.
+/// No external tools required — works on any stock macOS installation.
 pub fn get_video_metadata(path: &str) -> Result<VideoMetadata, String> {
-    let output = Command::new("ffprobe")
+    // Try Spotlight first (fast, no decode)
+    if let Ok(meta) = get_video_metadata_mdls(path) {
+        if meta.duration_secs > 0.0 && meta.width > 0 {
+            return Ok(meta);
+        }
+    }
+    // Spotlight may not have indexed a freshly recorded file — fall back to AVURLAsset via JXA
+    get_video_metadata_jxa(path)
+}
+
+fn get_video_metadata_mdls(path: &str) -> Result<VideoMetadata, String> {
+    // Force Spotlight to index the file — important for freshly recorded files
+    let _ = Command::new("mdimport").arg(path).output();
+
+    let output = Command::new("mdls")
         .args([
-            "-v", "quiet",
-            "-print_format", "json",
-            "-show_format",
-            "-show_streams",
+            "-name", "kMDItemDurationSeconds",
+            "-name", "kMDItemPixelWidth",
+            "-name", "kMDItemPixelHeight",
+            "-name", "kMDItemCodecs",
+            "-name", "kMDItemAudioChannelCount",
+            "-name", "kMDItemAudioSampleRate",
+            "-name", "kMDItemVideoFrameRate",
+            "-name", "kMDItemFSSize",
+            "-name", "kMDItemContentCreationDate",
             path,
         ])
         .output()
-        .map_err(|e| format!("ffprobe not found: {}. Install with: brew install ffmpeg", e))?;
+        .map_err(|e| format!("mdls failed: {}", e))?;
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("ffprobe failed: {}", stderr));
-    }
+    let text = String::from_utf8_lossy(&output.stdout);
 
-    let json: serde_json::Value = serde_json::from_slice(&output.stdout)
-        .map_err(|e| format!("Failed to parse ffprobe output: {}", e))?;
-
-    // Find video stream
-    let streams = json["streams"].as_array()
-        .ok_or("No streams found in video")?;
-
-    let video_stream = streams.iter()
-        .find(|s| s["codec_type"].as_str() == Some("video"))
-        .ok_or("No video stream found")?;
-
-    let audio_stream = streams.iter()
-        .find(|s| s["codec_type"].as_str() == Some("audio"));
-
-    let width = video_stream["width"].as_u64().unwrap_or(0) as u32;
-    let height = video_stream["height"].as_u64().unwrap_or(0) as u32;
-    let codec = video_stream["codec_name"].as_str().unwrap_or("unknown").to_string();
-
-    // Parse framerate from r_frame_rate (e.g. "30/1" or "60000/1001")
-    let fps_str = video_stream["r_frame_rate"].as_str().unwrap_or("30/1");
-    let fps = parse_frame_rate(fps_str);
-
-    // Duration from format
-    let duration = json["format"]["duration"]
-        .as_str()
-        .and_then(|s| s.parse::<f64>().ok())
-        .unwrap_or(0.0);
-
-    let file_size = json["format"]["size"]
-        .as_str()
-        .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or_else(|| {
-            std::fs::metadata(path).map(|m| m.len()).unwrap_or(0)
-        });
-
-    let creation_date = json["format"]["tags"]["creation_time"]
-        .as_str()
-        .unwrap_or("")
-        .to_string();
-
-    let (audio_channels, audio_sample_rate) = if let Some(audio) = audio_stream {
-        let ch = audio["channels"].as_u64().unwrap_or(0) as u32;
-        let sr = audio["sample_rate"].as_str()
-            .and_then(|s| s.parse::<u32>().ok())
-            .unwrap_or(0);
-        (ch, sr)
-    } else {
-        (0, 0)
-    };
+    let duration = mdls_float(&text, "kMDItemDurationSeconds").unwrap_or(0.0);
+    let width    = mdls_u32(&text, "kMDItemPixelWidth").unwrap_or(0);
+    let height   = mdls_u32(&text, "kMDItemPixelHeight").unwrap_or(0);
+    let fps      = mdls_float(&text, "kMDItemVideoFrameRate").unwrap_or(30.0);
+    let audio_channels   = mdls_u32(&text, "kMDItemAudioChannelCount").unwrap_or(0);
+    let audio_sample_rate = mdls_u32(&text, "kMDItemAudioSampleRate").unwrap_or(0);
+    let creation_date = mdls_string(&text, "kMDItemContentCreationDate").unwrap_or_default();
+    let codec    = mdls_codec(&text);
+    let file_size = mdls_u64(&text, "kMDItemFSSize")
+        .unwrap_or_else(|| std::fs::metadata(path).map(|m| m.len()).unwrap_or(0));
 
     Ok(VideoMetadata {
         path: path.to_string(),
@@ -215,83 +193,260 @@ pub fn get_video_metadata(path: &str) -> Result<VideoMetadata, String> {
         fps,
         codec,
         file_size_bytes: file_size,
-        has_audio: audio_stream.is_some(),
+        has_audio: audio_channels > 0,
         audio_channels,
         audio_sample_rate,
         creation_date,
     })
 }
 
-fn parse_frame_rate(s: &str) -> f64 {
-    if let Some((num, den)) = s.split_once('/') {
-        let n: f64 = num.parse().unwrap_or(30.0);
-        let d: f64 = den.parse().unwrap_or(1.0);
-        if d > 0.0 { n / d } else { 30.0 }
-    } else {
-        s.parse().unwrap_or(30.0)
+fn mdls_raw_value(text: &str, key: &str) -> Option<String> {
+    for line in text.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with(key) {
+            if let Some(eq) = trimmed.find('=') {
+                return Some(trimmed[eq + 1..].trim().to_string());
+            }
+        }
     }
+    None
+}
+
+fn mdls_float(text: &str, key: &str) -> Option<f64> {
+    let v = mdls_raw_value(text, key)?;
+    if v == "(null)" { return None; }
+    v.parse().ok()
+}
+
+fn mdls_u32(text: &str, key: &str) -> Option<u32> {
+    let v = mdls_raw_value(text, key)?;
+    if v == "(null)" { return None; }
+    // mdls may return floats for integer fields on some macOS versions
+    v.parse::<u32>().ok().or_else(|| v.parse::<f64>().ok().map(|f| f as u32))
+}
+
+fn mdls_u64(text: &str, key: &str) -> Option<u64> {
+    let v = mdls_raw_value(text, key)?;
+    if v == "(null)" { return None; }
+    v.parse().ok()
+}
+
+fn mdls_string(text: &str, key: &str) -> Option<String> {
+    let v = mdls_raw_value(text, key)?;
+    if v == "(null)" { return None; }
+    Some(v.trim_matches('"').to_string())
+}
+
+/// Parse video codec from mdls array: kMDItemCodecs = ("AAC", "H.265")
+fn mdls_codec(text: &str) -> String {
+    let mut in_block = false;
+    let mut codecs: Vec<String> = Vec::new();
+    for line in text.lines() {
+        let t = line.trim_start();
+        if t.starts_with("kMDItemCodecs") && t.contains('=') {
+            in_block = true;
+            // values may be on the same line: kMDItemCodecs = ("H.265")
+            if let Some(start) = t.find('(') {
+                let rest = &t[start + 1..];
+                let content = rest.split(')').next().unwrap_or(rest);
+                for part in content.split(',') {
+                    let c = part.trim().trim_matches('"').to_string();
+                    if !c.is_empty() { codecs.push(c); }
+                }
+                if t.contains(')') { in_block = false; }
+            }
+        } else if in_block {
+            if t.contains(')') { in_block = false; }
+            let c = t.trim_matches('"').to_string();
+            if !c.is_empty() && c != "(" && c != ")" { codecs.push(c); }
+        }
+    }
+    for c in &codecs {
+        let l = c.to_lowercase();
+        if l.contains("265") || l.contains("hevc") { return "hevc".to_string(); }
+        if l.contains("264") || l.contains("avc")  { return "h264".to_string(); }
+        if l.contains("prores")                    { return "prores".to_string(); }
+    }
+    codecs.into_iter().next().unwrap_or_else(|| "hevc".to_string())
+}
+
+/// Fallback metadata extraction via JXA + AVURLAsset.
+/// Works for freshly recorded files before Spotlight has indexed them.
+fn get_video_metadata_jxa(path: &str) -> Result<VideoMetadata, String> {
+    let safe_path = path.replace('\\', "\\\\").replace('\'', "\\'");
+    let script = format!(
+        r#"ObjC.import('AVFoundation');
+ObjC.import('Foundation');
+ObjC.import('CoreMedia');
+
+var url = $.NSURL.fileURLWithPath('{safe_path}');
+var assetCls = $.NSClassFromString('AVURLAsset');
+var asset = assetCls.alloc.initWithURLOptions(url, $());
+
+var duration = $.CMTimeGetSeconds(asset.duration);
+
+var width = 0, height = 0, fps = 30.0;
+var vt = asset.tracksWithMediaType('vide');
+if (vt && vt.count > 0) {{
+    var t = vt.objectAtIndex(0);
+    var sz = t.naturalSize;
+    width  = Math.round(sz.width);
+    height = Math.round(sz.height);
+    fps    = t.nominalFrameRate;
+}}
+
+var hasAudio = false;
+var at = asset.tracksWithMediaType('soun');
+if (at && at.count > 0) {{ hasAudio = true; }}
+
+var fileSize = 0;
+try {{
+    var attrs = $.NSFileManager.defaultManager.attributesOfItemAtPathError(url.path, null);
+    if (attrs && !attrs.isNil()) {{ fileSize = attrs.objectForKey('NSFileSize').longLongValue; }}
+}} catch(e) {{}}
+
+JSON.stringify({{duration: duration, width: width, height: height, fps: fps,
+                 hasAudio: hasAudio, fileSize: fileSize}});"#
+    );
+
+    let output = Command::new("osascript")
+        .args(["-l", "JavaScript", "-e", &script])
+        .output()
+        .map_err(|e| format!("osascript failed: {}", e))?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let parsed: serde_json::Value = serde_json::from_str(&stdout)
+        .map_err(|e| format!("AVURLAsset metadata parse error: {} (raw: {})", e, &stdout[..stdout.len().min(300)]))?;
+
+    let duration  = parsed["duration"].as_f64().unwrap_or(0.0);
+    let width     = parsed["width"].as_u64().unwrap_or(0) as u32;
+    let height    = parsed["height"].as_u64().unwrap_or(0) as u32;
+    let fps       = parsed["fps"].as_f64().unwrap_or(30.0);
+    let has_audio = parsed["hasAudio"].as_bool().unwrap_or(false);
+    let file_size = parsed["fileSize"].as_u64()
+        .unwrap_or_else(|| std::fs::metadata(path).map(|m| m.len()).unwrap_or(0));
+
+    Ok(VideoMetadata {
+        path: path.to_string(),
+        duration_secs: duration,
+        width,
+        height,
+        fps,
+        codec: "hevc".to_string(),
+        file_size_bytes: file_size,
+        has_audio,
+        audio_channels:   if has_audio { 2 } else { 0 },
+        audio_sample_rate: if has_audio { 44100 } else { 0 },
+        creation_date: String::new(),
+    })
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-//  Timeline Thumbnails (via ffmpeg)
+//  Timeline Thumbnails (via AVAssetImageGenerator — no ffmpeg needed)
 // ═══════════════════════════════════════════════════════════════════════
 
-/// Generate timeline thumbnail strip — evenly-spaced JPEG snapshots.
-/// Uses ffmpeg's hardware-accelerated VideoToolbox decoder on macOS.
+/// Generate timeline thumbnail strip via AVAssetImageGenerator (JXA bridge).
+/// Uses VideoToolbox hardware-accelerated HEVC decoding. No external tools required.
 pub fn generate_timeline_thumbnails(
     path: &str,
     count: usize,
     thumb_height: u32,
 ) -> Result<Vec<TimelineThumbnail>, String> {
-    use base64::Engine;
-
     let meta = get_video_metadata(path)?;
     if meta.duration_secs <= 0.0 {
         return Err("Video has zero duration".into());
     }
 
-    let count = count.max(2).min(120); // clamp to reasonable range
+    let count = count.max(2).min(120);
     let interval = meta.duration_secs / count as f64;
     let thumb_h = thumb_height.max(40).min(200);
-    let aspect = meta.width as f64 / meta.height.max(1) as f64;
-    let thumb_w = ((thumb_h as f64 * aspect) as u32 / 2) * 2; // ensure even
 
-    let mut thumbnails = Vec::with_capacity(count);
+    let timestamps: Vec<f64> = (0..count)
+        .map(|i| (interval * i as f64 + interval * 0.5).min(meta.duration_secs - 0.01))
+        .collect();
 
-    for i in 0..count {
-        let time = interval * i as f64 + interval * 0.5; // center of each bucket
-        let time = time.min(meta.duration_secs - 0.01);
+    let timestamps_json = serde_json::to_string(&timestamps).unwrap_or_else(|_| "[]".to_string());
+    let safe_path = path.replace('\\', "\\\\").replace('\'', "\\'");
 
-        // Use ffmpeg to extract a single frame at the given timestamp
-        // -hwaccel videotoolbox uses Apple's Media Engine for HEVC decode
-        let output = Command::new("ffmpeg")
-            .args([
-                "-hwaccel", "videotoolbox",
-                "-ss", &format!("{:.3}", time),
-                "-i", path,
-                "-vframes", "1",
-                "-vf", &format!("scale={}:{}:flags=bilinear", thumb_w, thumb_h),
-                "-f", "image2pipe",
-                "-vcodec", "mjpeg",
-                "-q:v", "8",
-                "-",
-            ])
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null())
-            .output()
-            .map_err(|e| format!("ffmpeg thumbnail failed: {}", e))?;
+    let script = format!(
+        r#"ObjC.import('AVFoundation');
+ObjC.import('AppKit');
+ObjC.import('CoreMedia');
+ObjC.import('Foundation');
 
-        if output.stdout.is_empty() {
-            continue; // skip failed frames
-        }
+var videoPath = '{safe_path}';
+var timestamps = {timestamps_json};
+var thumbH = {thumb_h};
 
-        let b64 = base64::engine::general_purpose::STANDARD.encode(&output.stdout);
-        thumbnails.push(TimelineThumbnail {
-            time_secs: time,
-            index: i,
-            data_url: format!("data:image/jpeg;base64,{}", b64),
-        });
+var url = $.NSURL.fileURLWithPath(videoPath);
+var assetCls = $.NSClassFromString('AVURLAsset');
+var asset = assetCls.alloc.initWithURLOptions(url, $());
+
+var natW = 1920, natH = 1080;
+var vt = asset.tracksWithMediaType('vide');
+if (vt && vt.count > 0) {{
+    var sz = vt.objectAtIndex(0).naturalSize;
+    natW = Math.round(sz.width);
+    natH = Math.round(sz.height);
+}}
+var thumbW = Math.round(thumbH * natW / Math.max(natH, 1) / 2) * 2;
+
+var genCls = $.NSClassFromString('AVAssetImageGenerator');
+var gen = genCls.assetImageGeneratorWithAsset(asset);
+gen.appliesPreferredTrackTransform = true;
+gen.maximumSize = {{width: thumbW, height: thumbH}};
+
+var results = [];
+for (var i = 0; i < timestamps.length; i++) {{
+    var t = timestamps[i];
+    try {{
+        var cmTime = $.CMTimeMakeWithSeconds(t, 600);
+        var cgImage = gen.copyCGImageAtTimeActualTimeError(cmTime, null, null);
+        if (cgImage) {{
+            var nsImg = $.NSImage.alloc.initWithCGImageSize(cgImage, {{width: thumbW, height: thumbH}});
+            var tiffData = nsImg.TIFFRepresentation;
+            var bmpRep = $.NSBitmapImageRep.imageRepWithData(tiffData);
+            var props = $.NSDictionary.dictionaryWithObjectForKey(
+                $.NSNumber.numberWithFloat(0.75), 'NSImageCompressionFactor'
+            );
+            var jpegData = bmpRep.representationUsingTypeProperties(
+                $.NSBitmapImageFileTypeJPEG, props
+            );
+            if (jpegData && jpegData.length > 0) {{
+                var b64 = ObjC.unwrap(jpegData.base64EncodedStringWithOptions(0));
+                results.push({{time_secs: t, index: i, data_url: 'data:image/jpeg;base64,' + b64}});
+            }}
+        }}
+    }} catch(e) {{}}
+}}
+
+JSON.stringify(results);"#
+    );
+
+    let output = Command::new("osascript")
+        .args(["-l", "JavaScript", "-e", &script])
+        .output()
+        .map_err(|e| format!("thumbnail generation failed: {}", e))?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if stdout.is_empty() {
+        return Ok(vec![]); // graceful empty — frontend handles missing thumbnails
     }
+
+    let parsed: serde_json::Value = serde_json::from_str(&stdout)
+        .map_err(|e| format!("thumbnail parse error: {} (raw: {})", e, &stdout[..stdout.len().min(200)]))?;
+
+    let thumbnails: Vec<TimelineThumbnail> = parsed.as_array()
+        .map(|arr| {
+            arr.iter().filter_map(|item| {
+                Some(TimelineThumbnail {
+                    time_secs: item["time_secs"].as_f64()?,
+                    index:     item["index"].as_u64()? as usize,
+                    data_url:  item["data_url"].as_str()?.to_string(),
+                })
+            }).collect()
+        })
+        .unwrap_or_default();
 
     println!(
         "[editor] Generated {} thumbnails for {} ({:.1}s)",
@@ -307,6 +462,7 @@ pub fn generate_timeline_thumbnails(
 
 /// Generate audio waveform data for timeline display.
 /// Outputs normalized amplitude samples binned into buckets.
+/// Falls back to a flat (silent) waveform if ffmpeg is not available.
 pub fn generate_waveform(path: &str, num_samples: usize) -> Result<WaveformData, String> {
     let meta = get_video_metadata(path)?;
     if !meta.has_audio || meta.duration_secs <= 0.0 {
@@ -319,9 +475,8 @@ pub fn generate_waveform(path: &str, num_samples: usize) -> Result<WaveformData,
 
     let num_samples = num_samples.max(50).min(2000);
 
-    // Extract raw PCM audio using ffmpeg
-    // -ac 1: mono, -ar 8000: low sample rate for waveform (fast)
-    let output = Command::new("ffmpeg")
+    // Extract raw PCM audio using ffmpeg (optional — falls back to flat waveform)
+    let output = match Command::new("ffmpeg")
         .args([
             "-i", path,
             "-ac", "1",
@@ -333,7 +488,17 @@ pub fn generate_waveform(path: &str, num_samples: usize) -> Result<WaveformData,
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
         .output()
-        .map_err(|e| format!("ffmpeg waveform failed: {}", e))?;
+    {
+        Ok(o) => o,
+        Err(_) => {
+            // ffmpeg not available — return flat waveform (editor still usable)
+            return Ok(WaveformData {
+                samples: vec![0.0; num_samples],
+                bucket_duration: meta.duration_secs / num_samples as f64,
+                total_duration: meta.duration_secs,
+            });
+        }
+    };
 
     let pcm_data = &output.stdout;
     let sample_count = pcm_data.len() / 2; // 16-bit samples
