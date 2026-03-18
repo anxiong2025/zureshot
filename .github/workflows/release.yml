@@ -65,7 +65,8 @@ jobs:
             libxfixes-dev \
             libunwind-dev \
             libgstreamer1.0-dev \
-            libgstreamer-plugins-base1.0-dev
+            libgstreamer-plugins-base1.0-dev \
+            libfuse2
 
       - name: Install frontend dependencies
         run: pnpm install
