@@ -5901,6 +5901,7 @@ dependencies = [
  "dirs 5.0.1",
  "dispatch2",
  "gstreamer",
+ "image",
  "objc2",
  "objc2-av-foundation",
  "objc2-core-foundation",

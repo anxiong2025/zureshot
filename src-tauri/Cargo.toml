@@ -44,6 +44,7 @@ dispatch2 = "0.3"
 [target.'cfg(target_os = "linux")'.dependencies]
 ashpd = { version = "0.10", default-features = false, features = ["tokio"] }
 gstreamer = "0.23"
+image = { version = "0.25", default-features = false, features = ["png"] }
 
 [features]
 default = ["custom-protocol"]
