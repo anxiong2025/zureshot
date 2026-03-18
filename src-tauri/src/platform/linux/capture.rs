@@ -51,11 +51,10 @@ fn take_via_portal(
 
     let uri: String = runtime.block_on(async {
         use ashpd::desktop::screenshot::Screenshot;
-        let proxy = Screenshot::new()
-            .await
-            .map_err(|e| format!("Screenshot portal unavailable: {e}"))?;
-        let response = proxy
-            .screenshot(None, false)
+        let response = Screenshot::request()
+            .interactive(false)
+            .modal(false)
+            .send()
             .await
             .map_err(|e| format!("Screenshot portal call failed: {e}"))?
             .response()
